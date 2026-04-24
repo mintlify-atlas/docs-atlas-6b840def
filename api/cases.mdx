@@ -1,0 +1,304 @@
+---
+title: "Cases API: create, query, and finalize workflow cases"
+description: "REST endpoints for creating workflow cases, querying with date and status filters, generating AI suggestions, and submitting role-gated reviewer decisions."
+---
+
+The `/cases` resource is the core of the workflow. Each case represents one run of a workflow type — for example, a daily cash reconciliation — tied to a `businessDate`, a set of typed inputs, and a lifecycle that moves from `OPEN` through AI review to a human finalization decision. Every state change is written transactionally alongside an immutable audit entry, so the record is always consistent.
+
+## List cases
+
+<ParamField query="from" type="string">
+  ISO date string (e.g. `2026-01-01`). Filters cases where `businessDate >= from`.
+</ParamField>
+
+<ParamField query="to" type="string">
+  ISO date string (e.g. `2026-12-31`). Filters cases where `businessDate <= to`.
+</ParamField>
+
+<ParamField query="caseTypeId" type="string">
+  Restrict results to a single case type by its ID.
+</ParamField>
+
+<ParamField query="status" type="string | string[]">
+  One or more status values to include. Accepted values: `OPEN`, `UNDER_REVIEW`, `APPROVED`, `ESCALATED`, `CLOSED`. Repeat the parameter to filter on multiple statuses.
+</ParamField>
+
+<ParamField query="slaBreached" type="string">
+  `"true"` or `"false"`. When set, restricts results to cases that have or have not breached their SLA deadline.
+</ParamField>
+
+Returns an array of serialized case objects ordered by `businessDate` descending, then `createdAt` descending. No authentication required.
+
+```bash
+# All open cases in Q1 2026
+curl "http://localhost:4000/cases?from=2026-01-01&to=2026-03-31&status=OPEN"
+
+# SLA-breached cases of any status
+curl "http://localhost:4000/cases?slaBreached=true"
+```
+
+<ResponseField name="id" type="string">
+  CUID identifier for the case.
+</ResponseField>
+
+<ResponseField name="caseTypeId" type="string">
+  ID of the parent case type.
+</ResponseField>
+
+<ResponseField name="caseType" type="object">
+  Embedded case type object including `rulesConfig` and `slaConfig`.
+</ResponseField>
+
+<ResponseField name="businessDate" type="string">
+  ISO 8601 timestamp for the business date this case covers.
+</ResponseField>
+
+<ResponseField name="status" type="string">
+  One of `OPEN`, `UNDER_REVIEW`, `APPROVED`, `ESCALATED`, `CLOSED`.
+</ResponseField>
+
+<ResponseField name="dueAt" type="string">
+  ISO 8601 timestamp. Computed from `businessDate` + `slaConfig.dueTimeOfDay` at creation time.
+</ResponseField>
+
+<ResponseField name="slaBreached" type="boolean">
+  `true` if the reviewer decision was recorded after `dueAt`.
+</ResponseField>
+
+<ResponseField name="inputs" type="object">
+  Key/value map of inputs submitted when the case was created (e.g. `bankBalance`, `ledgerBalance`, `variance`).
+</ResponseField>
+
+<ResponseField name="aiSuggestion" type="object | null">
+  Present after `POST /cases/:id/ai-suggestion` succeeds. Contains `suggestedStatus`, `explanation`, `modelName`, `runId`, and `generatedAt`.
+</ResponseField>
+
+<ResponseField name="reviewerDecision" type="object | null">
+  Present after `POST /cases/:id/reviewer-decision` succeeds. Contains `finalStatus`, `decisionNote`, and `decidedAt`.
+</ResponseField>
+
+<ResponseField name="createdBy" type="object">
+  User object `{ id, name, email, role }` for the user who opened the case.
+</ResponseField>
+
+<ResponseField name="reviewer" type="object | null">
+  User object for the reviewer who finalized the case, or `null` if not yet decided.
+</ResponseField>
+
+---
+
+## Get case detail
+
+```
+GET /cases/:id
+```
+
+Returns the full case object plus an embedded `auditLogs` array ordered chronologically. No authentication required.
+
+```bash
+curl "http://localhost:4000/cases/clx1abc000001"
+```
+
+<ResponseField name="auditLogs" type="array">
+  Ordered array of audit log entries for this case. See [Audit logs API](/api/audit-logs) for the entry shape.
+</ResponseField>
+
+---
+
+## Create case
+
+```
+POST /cases
+```
+
+Requires authentication (`x-user-id` header). Any authenticated user may create a case. On success the server validates `inputs` against the case type's `rulesConfig.requiredInputs`, computes `dueAt` from `slaConfig`, creates the case with status `OPEN`, and writes a `CASE_CREATED` audit entry — all in a single transaction.
+
+<ParamField body="caseTypeId" type="string" required>
+  ID of the case type that defines the rules, SLA, and required inputs for this case.
+</ParamField>
+
+<ParamField body="businessDate" type="string" required>
+  ISO date string for the business date this case covers (e.g. `"2026-04-24"`).
+</ParamField>
+
+<ParamField body="inputs" type="object" required>
+  Key/value map of inputs. Fields must satisfy the case type's `rulesConfig.requiredInputs`. For the built-in cash reconciliation type this means `bankBalance`, `ledgerBalance`, and `variance` (all numbers).
+</ParamField>
+
+**Example request:**
+
+```bash
+curl -X POST http://localhost:4000/cases \
+  -H "Content-Type: application/json" \
+  -H "x-user-id: user_analyst_01" \
+  -d '{
+    "caseTypeId": "ct_cash_rec_01",
+    "businessDate": "2026-04-24",
+    "inputs": {
+      "bankBalance": 1000000,
+      "ledgerBalance": 999500,
+      "variance": 500,
+      "notes": "Minor timing difference, awaiting wire confirm."
+    }
+  }'
+```
+
+**Example response (201):**
+
+```json
+{
+  "id": "clx9abc000002",
+  "caseTypeId": "ct_cash_rec_01",
+  "businessDate": "2026-04-24T00:00:00.000Z",
+  "status": "OPEN",
+  "dueAt": "2026-04-24T16:00:00.000Z",
+  "slaBreached": false,
+  "inputs": {
+    "bankBalance": 1000000,
+    "ledgerBalance": 999500,
+    "variance": 500,
+    "notes": "Minor timing difference, awaiting wire confirm."
+  },
+  "aiSuggestion": null,
+  "reviewerDecision": null,
+  "createdByUserId": "user_analyst_01",
+  "createdAt": "2026-04-24T09:13:00.000Z",
+  "updatedAt": "2026-04-24T09:13:00.000Z",
+  "auditLogs": [
+    {
+      "id": "al_001",
+      "caseId": "clx9abc000002",
+      "timestamp": "2026-04-24T09:13:00.000Z",
+      "actorType": "USER",
+      "actorId": "user_analyst_01",
+      "actionType": "CASE_CREATED",
+      "details": {
+        "inputs": { "bankBalance": 1000000, "ledgerBalance": 999500, "variance": 500 },
+        "caseTypeName": "Daily Cash Reconciliation",
+        "dueAt": "2026-04-24T16:00:00.000Z"
+      }
+    }
+  ]
+}
+```
+
+---
+
+## Update case inputs
+
+```
+PATCH /cases/:id/inputs
+```
+
+Requires authentication. Updates the `inputs` on an existing case before it is finalized. Returns `409 Conflict` if the case status is `APPROVED`, `ESCALATED`, or `CLOSED`. Writes an `INPUTS_UPDATED` audit entry in the same transaction.
+
+<ParamField body="inputs" type="object" required>
+  Replacement key/value map of inputs. Must pass the same `rulesConfig.requiredInputs` validation as on creation.
+</ParamField>
+
+```bash
+curl -X PATCH http://localhost:4000/cases/clx9abc000002/inputs \
+  -H "Content-Type: application/json" \
+  -H "x-user-id: user_analyst_01" \
+  -d '{
+    "inputs": {
+      "bankBalance": 1000000,
+      "ledgerBalance": 1000000,
+      "variance": 0,
+      "notes": "Wire confirmed. Variance resolved."
+    }
+  }'
+```
+
+---
+
+## Generate AI suggestion
+
+```
+POST /cases/:id/ai-suggestion
+```
+
+Requires authentication. Triggers the configured AI provider (rule-based or OpenAI) to evaluate the case inputs against the case type's `rulesConfig` and produce a structured suggestion. No request body is required.
+
+The endpoint **never sets the final status** — it only writes to `Case.aiSuggestion`. If the case is currently `OPEN`, the status is advanced to `UNDER_REVIEW` automatically. Cases already at `UNDER_REVIEW` retain that status. Cases in a terminal state (`APPROVED`, `ESCALATED`, `CLOSED`) return `409 Conflict`.
+
+An `AI_SUGGESTION_GENERATED` audit entry is written with the full suggestion, `modelName`, `runId`, and a snapshot of `rulesConfig` so every AI call is reproducible.
+
+```bash
+curl -X POST http://localhost:4000/cases/clx9abc000002/ai-suggestion \
+  -H "x-user-id: user_analyst_01"
+```
+
+<ResponseField name="aiSuggestion.suggestedStatus" type="string">
+  `"OK"` if the AI recommends approval, `"ESCALATE"` if it recommends escalation.
+</ResponseField>
+
+<ResponseField name="aiSuggestion.explanation" type="string">
+  Human-readable rationale produced by the AI provider.
+</ResponseField>
+
+<ResponseField name="aiSuggestion.modelName" type="string">
+  Identifier of the model that produced the suggestion (e.g. `"gpt-4o"` or `"rule-based-v1"`).
+</ResponseField>
+
+<ResponseField name="aiSuggestion.runId" type="string">
+  Unique run identifier. Preserved in the audit log to make the call reproducible.
+</ResponseField>
+
+<ResponseField name="aiSuggestion.generatedAt" type="string">
+  ISO 8601 timestamp when the suggestion was generated.
+</ResponseField>
+
+---
+
+## Submit reviewer decision
+
+```
+POST /cases/:id/reviewer-decision
+```
+
+Requires authentication **and** the `OPS` or `CCO` role. Finalizes the case by setting its status to either `APPROVED` or `ESCALATED`. Returns `409 Conflict` if the case is already finalized.
+
+The service records the decision timestamp, evaluates whether `dueAt` has passed, and in a single transaction:
+
+1. Updates `Case.status` and `Case.reviewerDecision`.
+2. Writes a `DECISION_MADE` audit entry with the prior AI suggestion attached for comparison.
+3. If the decision time is after `dueAt`, writes a separate `SLA_BREACH_RECORDED` entry with `dueAt`, `decidedAt`, and `delayMinutes`.
+
+<ParamField body="finalStatus" type="string" required>
+  The finalization decision. Must be `"APPROVED"` or `"ESCALATED"`.
+</ParamField>
+
+<ParamField body="decisionNote" type="string" required>
+  Reviewer's rationale (1–2000 characters). Preserved verbatim on the audit entry and in the CSV export.
+</ParamField>
+
+```bash
+curl -X POST http://localhost:4000/cases/clx9abc000002/reviewer-decision \
+  -H "Content-Type: application/json" \
+  -H "x-user-id: user_ops_01" \
+  -d '{
+    "finalStatus": "APPROVED",
+    "decisionNote": "Variance is within $500 tolerance. Wire confirmed at 10:42. Approved."
+  }'
+```
+
+<ResponseField name="status" type="string">
+  Updated case status: `"APPROVED"` or `"ESCALATED"`.
+</ResponseField>
+
+<ResponseField name="slaBreached" type="boolean">
+  Whether the SLA deadline was missed.
+</ResponseField>
+
+<ResponseField name="sla.slaBreached" type="boolean">
+  Top-level SLA result returned alongside the case: `true` if decided after `dueAt`.
+</ResponseField>
+
+<ResponseField name="sla.delayMinutes" type="number">
+  Minutes between `dueAt` and `decidedAt`. Zero if decided on time.
+</ResponseField>
+
+<Warning>
+  Only users with the `OPS` or `CCO` role may call this endpoint. Requests from `ANALYST` or `ADMIN` users receive `403 Forbidden`.
+</Warning>

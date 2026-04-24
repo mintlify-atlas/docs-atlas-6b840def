@@ -1,0 +1,78 @@
+---
+title: "Cash Reconciliation Workflow: SEC-Aware AI for Fund Ops"
+description: "An open-source compliance workflow that combines AI-assisted cash reconciliation with human oversight, append-only audit logs, and Rule 204-2 export tools."
+---
+
+The Cash Reconciliation Workflow is a production-shaped demo showing how a private fund adviser can embed AI into daily operations without sacrificing the audit trail, human accountability, or regulatory posture the SEC expects under Rule 204-2.
+
+It covers one case type end-to-end — daily cash reconciliation between a fund's bank balance and its ledger balance — and makes the *workflow shell around the AI* the primary artifact. The reconciliation math is intentionally simple; the controls are not.
+
+<CardGroup cols={2}>
+  <Card title="Quickstart" icon="rocket" href="/quickstart">
+    Clone, seed, and run the full workflow demo in under five minutes — no API key required.
+  </Card>
+  <Card title="Demo walkthrough" icon="play" href="/demo-walkthrough">
+    Step through the five seeded cases that tell a complete compliance story.
+  </Card>
+  <Card title="Core concepts" icon="book" href="/concepts/workflow-model">
+    Understand how cases, AI suggestions, reviewer decisions, and audit entries fit together.
+  </Card>
+  <Card title="API reference" icon="code" href="/api/overview">
+    Explore the full REST API — endpoints, schemas, and auth requirements.
+  </Card>
+</CardGroup>
+
+## What makes this different
+
+Most AI-in-ops demos let the model act directly on data. This one doesn't. Every design choice reflects a specific compliance constraint:
+
+<CardGroup cols={2}>
+  <Card title="AI suggests, never decides" icon="robot">
+    The AI provider writes only to `Case.aiSuggestion`. Finalization is a separate endpoint behind a role gate.
+  </Card>
+  <Card title="Humans decide on the record" icon="user-check">
+    Every reviewer decision includes a mandatory note and a timestamp, stored in the same transaction as the status change.
+  </Card>
+  <Card title="Append-only audit log" icon="scroll">
+    No update or delete route exists on `AuditLog`. Every state change and every AI call writes an immutable row.
+  </Card>
+  <Card title="Exam-ready exports" icon="file-export">
+    `GET /export/cases.csv` and `GET /export/audit-logs.csv` — plus a CLI — cover any date range an examiner might request.
+  </Card>
+</CardGroup>
+
+## How the stack fits together
+
+```text
+┌──────────────────────────┐        ┌──────────────────────────┐
+│  Vite + React frontend   │        │  Express + Prisma API    │
+│  - Case List             │  HTTP  │  - /cases                │
+│  - Case Detail           │  ───▶  │  - /cases/:id/ai-*       │
+│  - Reviewer decision     │        │  - /cases/:id/reviewer-* │
+│  - Audit trail           │        │  - /audit-logs           │
+└──────────────────────────┘        │  - /export/*.csv         │
+                                    └────────────┬─────────────┘
+                                                 │
+                                    ┌────────────┴─────────────┐
+                                    │  Case / AuditLog tables  │
+                                    │  append-only writes in   │
+                                    │  a single Prisma tx      │
+                                    └──────────────────────────┘
+```
+
+The AI provider is swappable behind a single `AiProvider` interface — `OpenAiProvider` when `OPENAI_API_KEY` is set, `RuleBasedProvider` otherwise. No key is needed to run the full demo.
+
+## Regulatory grounding
+
+The design choices map directly to what the SEC has historically examined for registered investment advisers:
+
+| Concern | Implementation |
+|---|---|
+| Rule 204-2 books and records | Append-only audit log, transactional writes, CSV export for any date range |
+| Policies and procedures evidence | Workflow definition stored as data on `CaseType`, snapshotted into every audit row |
+| AI governance | Separate endpoints for suggestion vs. decision; `modelName + runId + rulesSnapshot` on every AI invocation |
+| Exceptions visible | `SLA_BREACH_RECORDED` is a first-class audit action; Case List has a dedicated SLA filter |
+
+<Note>
+This project is a demonstration piece, not legal advice. The design choices are grounded in publicly available SEC guidance but should be reviewed by qualified counsel before use in a live advisory context.
+</Note>

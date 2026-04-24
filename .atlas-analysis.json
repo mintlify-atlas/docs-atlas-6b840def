@@ -1,0 +1,110 @@
+{
+  "projectType": "saas",
+  "projectName": "Cash Reconciliation Workflow",
+  "projectDescription": "An SEC-aware compliance workflow that wraps AI cash reconciliation suggestions with human-in-the-loop controls, role-gated decisions, and an append-only audit log designed to satisfy Rule 204-2 books-and-records requirements.",
+  "theme": "luma",
+  "primaryColor": "#1F3A5F",
+  "lightColor": "#DCE6F8",
+  "darkColor": "#0E1116",
+  "navigation": {
+    "tabs": [
+      {
+        "tab": "Documentation",
+        "groups": [
+          {
+            "group": "Get Started",
+            "pages": [
+              "introduction",
+              "quickstart",
+              "demo-walkthrough"
+            ]
+          },
+          {
+            "group": "Core Concepts",
+            "pages": [
+              "concepts/workflow-model",
+              "concepts/ai-controls",
+              "concepts/audit-trail",
+              "concepts/sla-management"
+            ]
+          },
+          {
+            "group": "Configuration",
+            "pages": [
+              "configuration/environment",
+              "configuration/case-types",
+              "configuration/ai-providers"
+            ]
+          },
+          {
+            "group": "Compliance & Export",
+            "pages": [
+              "compliance/regulatory-framing",
+              "compliance/export-cli",
+              "compliance/design-system"
+            ]
+          }
+        ]
+      },
+      {
+        "tab": "API Reference",
+        "groups": [
+          {
+            "group": "Overview",
+            "pages": [
+              "api/overview",
+              "api/authentication"
+            ]
+          },
+          {
+            "group": "Endpoints",
+            "pages": [
+              "api/cases",
+              "api/case-types",
+              "api/audit-logs",
+              "api/exports",
+              "api/users"
+            ]
+          },
+          {
+            "group": "Data Model",
+            "pages": [
+              "api/data-model",
+              "api/schemas"
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "keyFeatures": [
+    "AI suggestion engine with swappable OpenAI and rule-based providers — AI suggests, never decides",
+    "Role-gated reviewer decisions (OPS / CCO) with mandatory decision notes",
+    "Append-only audit log with atomic transactional writes binding state changes to audit entries",
+    "SLA tracking with first-class SLA_BREACH_RECORDED audit entries and case list filter",
+    "Policy-as-data: rulesConfig and slaConfig stored on CaseType and snapshotted into every audit row",
+    "CSV export API and CLI for Rule 204-2 compliant books-and-records examination readiness",
+    "Shared Zod schemas across frontend and backend for type-safe request/response contracts",
+    "Institutional 'Ledger' design system with WCAG AA status palette tuned for compliance surfaces"
+  ],
+  "publicApiSurface": [
+    "GET /health",
+    "GET /users",
+    "GET /case-types",
+    "GET /case-types/:id",
+    "POST /case-types",
+    "GET /cases",
+    "GET /cases/:id",
+    "POST /cases",
+    "PATCH /cases/:id/inputs",
+    "POST /cases/:id/ai-suggestion",
+    "POST /cases/:id/reviewer-decision",
+    "GET /audit-logs",
+    "GET /export/cases.csv",
+    "GET /export/audit-logs.csv",
+    "AiProvider interface: suggest(input: AiProviderInput): Promise<AiSuggestion>",
+    "Shared types: Case, CaseType, AuditLogEntry, User, AiSuggestion, ReviewerDecision, RulesConfig, SlaConfig",
+    "Shared schemas: CreateCaseInputSchema, ReviewerDecisionInputSchema, CaseListQuerySchema, AuditLogQuerySchema, ExportQuerySchema",
+    "CLI: npm run export -- --from <date> --to <date> --out <dir>"
+  ]
+}

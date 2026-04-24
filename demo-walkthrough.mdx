@@ -1,0 +1,131 @@
+---
+title: "Walk through the five-minute compliance workflow demo"
+description: "Step through five seeded cases showing the full compliance lifecycle — create, AI suggest, decide, and export — covering every audit event type."
+---
+
+The seed script creates five cash reconciliation cases that together tell a compliance story an examiner or LP would recognize. Walked in order, they demonstrate every audit event type, the AI suggestion flow, the role-gated reviewer decision, and an SLA breach — all within a single case type. After the five cases, you trigger the interactive AI and decision flow live, then export the full record to CSV.
+
+<Note>
+  The four seeded users map to the four roles in the system. **Ava Analyst** (`ANALYST`) can create cases and generate AI suggestions. **Omar Ops** (`OPS`) can do everything above plus submit reviewer decisions. **Casey CCO** (`CCO`) has the same finalization rights as OPS and is used for escalated cases. **Alex Admin** (`ADMIN`) manages case type configuration. Use the **Acting as** dropdown in the top-right corner to switch between them at any time.
+</Note>
+
+## The five seeded cases
+
+<Steps>
+  <Step title="Case 1 — OPEN (today)">
+    Open the case created today. You will see four panels: **Inputs**, **AI Suggestion** (empty), **Reviewer Decision** (empty), and **Audit Trail**.
+
+    The audit trail contains exactly one entry: `CASE_CREATED`. Expand it to see the snapshot written at creation time — the full inputs object (`bankBalance: $10,250,000`, `ledgerBalance: $10,249,850`, `variance: $150.00`), the case type name, and the computed `dueAt` timestamp (16:00 today, the SLA deadline).
+
+    The AI Suggestion and Reviewer Decision panels are empty because no action has been taken yet. This is the case you will use for the interactive flow below.
+
+    **What to point out:** the audit row captures the policy-as-data snapshot at the moment the case was opened, so the record is self-contained even if the case type is later updated.
+  </Step>
+
+  <Step title="Case 2 — UNDER_REVIEW (yesterday)">
+    Open the case created yesterday. The AI Suggestion panel is now populated: the `RuleBasedProvider` (or your configured LLM) has already suggested **OK**.
+
+    The audit trail has two entries:
+
+    1. `CASE_CREATED` — inputs, case type name, and SLA snapshot.
+    2. `AI_SUGGESTION_GENERATED` — written by the `AI` actor. Expand it to see `modelName`, `runId` (`seed-run-case-2`), and a full `rulesSnapshot` capturing the $1,000.00 tolerance and escalation criteria that were in effect when the suggestion was produced.
+
+    The case is awaiting a reviewer decision. No `DECISION_MADE` entry exists yet.
+
+    **What to point out:** the AI suggestion and the finalization are separate endpoints. The AI writes only to `Case.aiSuggestion`; only a role-gated reviewer can move the case to a final status.
+  </Step>
+
+  <Step title="Case 3 — APPROVED (2 days ago)">
+    Open the case created two days ago. This is the full happy-path lifecycle: create → AI suggestion → reviewer approval, all within the SLA window.
+
+    The audit trail has three entries:
+
+    1. `CASE_CREATED`
+    2. `AI_SUGGESTION_GENERATED` — suggested **OK**, variance of -$50.00 within tolerance.
+    3. `DECISION_MADE` — Omar Ops approved at 14:30 with the note *"Variance nominal; timing difference on one wire. Approved."*
+
+    The status change from `UNDER_REVIEW` to `APPROVED` and the `DECISION_MADE` audit entry were written in a single Prisma transaction. There is no moment where the status changed without a corresponding audit record.
+
+    **What to point out:** the reviewer decision note is mandatory and stored permanently. The timestamp on `DECISION_MADE` is set by the server, not by the reviewer, so it cannot be backdated.
+  </Step>
+
+  <Step title="Case 4 — ESCALATED (3 days ago)">
+    Open the case created three days ago. The variance is $11,600.00 — well above the $1,000.00 tolerance.
+
+    The audit trail has three entries:
+
+    1. `CASE_CREATED`
+    2. `AI_SUGGESTION_GENERATED` — suggested **ESCALATE**, citing `variance_exceeds_tolerance`. The explanation reads: *"Variance of $11,600.00 exceeds the $1,000.00 tolerance (escalation criterion: variance_exceeds_tolerance). Recommend escalation and fund admin inquiry."*
+    3. `DECISION_MADE` — Casey CCO confirmed the escalation with the note *"Confirmed unexplained variance > tolerance. Escalated to CFO; opened ticket with fund administrator."*
+
+    **What to point out:** escalation is a normal end state, not an exception path. The CCO's note documents both the action taken and the external ticket created. An examiner can read the full chain without accessing any other system.
+  </Step>
+
+  <Step title="Case 5 — APPROVED + SLA breached (4 days ago)">
+    Open the case created four days ago. The status is `APPROVED`, but the **SLA breached** indicator is visible — and this case appears in the Case List when you filter by **SLA breached**.
+
+    The audit trail has four entries:
+
+    1. `CASE_CREATED`
+    2. `AI_SUGGESTION_GENERATED` — suggested **OK**, variance $400.00 within tolerance.
+    3. `DECISION_MADE` — Omar Ops approved at 18:45 with the note *"Reviewed late due to delayed custodian statement; variance nominal. SLA breach noted and logged."*
+    4. `SLA_BREACH_RECORDED` — written by the `SYSTEM` actor in the same transaction as `DECISION_MADE`. Expand it to see `dueAt` (16:00), `decidedAt` (18:45), and `delayMinutes`.
+
+    **What to point out:** the SLA breach is a first-class audit event even though the case was ultimately approved. `DECISION_MADE` and `SLA_BREACH_RECORDED` land atomically — there is no window where the breach is unrecorded. The Case List SLA filter surfaces this case for anyone auditing late completions.
+  </Step>
+</Steps>
+
+## Interactive AI and decision flow
+
+After reviewing the seeded cases, use Case 1 (status `OPEN`) to trigger the live workflow end to end.
+
+<Steps>
+  <Step title="Generate an AI suggestion as Ava Analyst">
+    Switch to **Ava Analyst** using the **Acting as** dropdown. Open the `OPEN` case.
+
+    Click **Generate AI suggestion**. Watch the `AI_SUGGESTION_GENERATED` row land in the audit trail in real time. The entry records `modelName`, `runId`, and a snapshot of the rules config — identical in structure to the entries in the seeded cases.
+
+    If `OPENAI_API_KEY` is blank, the `RuleBasedProvider` responds immediately. If you set a key, the entry still lands with the same shape; only `modelName` changes from `rule-based` to the configured OpenAI model.
+  </Step>
+
+  <Step title="Submit a reviewer decision as Omar Ops">
+    Switch to **Omar Ops** using the **Acting as** dropdown. The **Submit decision** button is now enabled.
+
+    Choose a final status (`APPROVE` or `ESCALATE`), enter a decision note, and click **Submit decision**. Watch the `DECISION_MADE` entry land in the audit trail. The case status updates immediately.
+
+    <Note>
+      The decision note is required. The backend rejects submissions without one. This is intentional: the compliance value of the workflow depends on reviewers stating their reasoning on the record.
+    </Note>
+  </Step>
+
+  <Step title="Export the full audit record">
+    Run the export CLI from the repo root to produce CSV files for any date range:
+
+    ```bash
+    npm run export -- --from 2026-01-01 --to 2026-12-31 --out ./out
+    ```
+
+    This produces two files in `./out/`:
+
+    | File | Contents |
+    |---|---|
+    | `cases.csv` | One row per case: ID, business date, status, SLA status, inputs summary, AI suggestion, reviewer decision note |
+    | `audit-logs.csv` | One row per audit entry: timestamp, case ID, actor type, actor ID, action type, full details JSON |
+
+    The same formatter powers both the CLI and the `GET /export/cases.csv` and `GET /export/audit-logs.csv` HTTP endpoints, so the files you hand to an examiner are identical to what the API produces.
+  </Step>
+</Steps>
+
+## What you just saw
+
+Every action in the workflow produces exactly one or two audit events, written atomically with the state change. The table below maps each action to the event it produces:
+
+| Action | Who can take it | Audit event(s) produced |
+|---|---|---|
+| Create a case | Any authenticated user | `CASE_CREATED` |
+| Update inputs (pre-finalization) | Any authenticated user | `INPUTS_UPDATED` |
+| Generate AI suggestion | Any authenticated user | `AI_SUGGESTION_GENERATED` |
+| Submit reviewer decision (on-time) | `OPS` or `CCO` | `DECISION_MADE` |
+| Submit reviewer decision (after `dueAt`) | `OPS` or `CCO` | `DECISION_MADE` + `SLA_BREACH_RECORDED` |
+
+No action produces zero audit events. No audit event can be updated or deleted — the `AuditLog` model exposes a write helper only, with no update or delete route.

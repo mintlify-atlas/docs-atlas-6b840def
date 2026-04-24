@@ -1,0 +1,132 @@
+---
+title: "Defining case types: rules and SLA configuration"
+description: "How CaseType rulesConfig and slaConfig parameterize the workflow — variance tolerance, required inputs, evidence, escalation criteria, and SLA deadlines."
+---
+
+A case type is the workflow definition. It describes what inputs an analyst must collect, what evidence is required, how large a variance is acceptable before escalation, which AI model to invoke, and when the review must be complete. All of this lives as two JSON blobs — `rulesConfig` and `slaConfig` — on the `CaseType` record. Every case that references a case type inherits a snapshot of those rules at creation time, so a historical decision stays explainable even after the policy is updated.
+
+## The rulesConfig schema
+
+`rulesConfig` controls what the AI evaluates and when escalation is triggered.
+
+```typescript
+interface RulesConfig {
+  varianceTolerance: number;           // Maximum acceptable absolute variance (in USD)
+  requiredInputs: FieldDefinition[];   // Fields the analyst must fill in
+  requiredEvidence: string[];          // Evidence keys that must be present
+  escalationCriteria: string[];        // Human-readable list of escalation triggers
+  aiModel: string;                     // Model name recorded on every AI suggestion
+}
+```
+
+### FieldDefinition
+
+Each entry in `requiredInputs` is a `FieldDefinition`:
+
+```typescript
+interface FieldDefinition {
+  name: string;                              // Field key used in case inputs
+  label: string;                             // Display label shown in the UI
+  type: "number" | "string" | "date" | "file";
+  required: boolean;                         // Whether a missing value triggers escalation
+}
+```
+
+## The slaConfig schema
+
+`slaConfig` controls the review deadline for every case of this type.
+
+```typescript
+interface SlaConfig {
+  dueTimeOfDay: string;              // HH:MM:SS — deadline time on the business date
+  maxCompletionDelayMinutes: number; // Grace period after dueTimeOfDay (0 = no grace)
+  defaultReviewerRole: Role;         // Role expected to make the final decision
+}
+```
+
+`Role` is one of `"ANALYST"`, `"OPS"`, `"CCO"`, or `"ADMIN"`.
+
+## Example: the Daily Cash Reconciliation case type
+
+The seed data ships with a fully configured `CASH_RECONCILIATION` case type. Here is its exact `rulesConfig` and `slaConfig`:
+
+```json
+{
+  "rulesConfig": {
+    "varianceTolerance": 1000.00,
+    "requiredInputs": [
+      { "name": "bankBalance",   "label": "Bank balance",                  "type": "number", "required": true  },
+      { "name": "ledgerBalance", "label": "Ledger balance",                "type": "number", "required": true  },
+      { "name": "variance",      "label": "Variance (bank - ledger)",       "type": "number", "required": true  },
+      { "name": "recFilePath",   "label": "Reconciliation evidence file",   "type": "file",   "required": false }
+    ],
+    "requiredEvidence": ["rec_file"],
+    "escalationCriteria": [
+      "variance_exceeds_tolerance",
+      "missing_required_input",
+      "missing_required_evidence"
+    ],
+    "aiModel": "gpt-4o-mini"
+  },
+  "slaConfig": {
+    "dueTimeOfDay": "16:00:00",
+    "maxCompletionDelayMinutes": 0,
+    "defaultReviewerRole": "OPS"
+  }
+}
+```
+
+This configuration means:
+
+- Any variance larger than $1,000 in absolute value triggers an escalation recommendation.
+- The analyst must provide `bankBalance`, `ledgerBalance`, and `variance`. The `recFilePath` field is collected but not required.
+- The `rec_file` evidence key must be present or the AI will recommend escalation.
+- Every review must be complete by 16:00 on the business date. A decision recorded after that time triggers a `SLA_BREACH_RECORDED` audit entry.
+- OPS is the expected reviewer role.
+
+## Creating a case type via the API
+
+Send a `POST /case-types` request (requires `ADMIN` or `CCO` role) with the following body shape:
+
+```json
+{
+  "name": "CASH_RECONCILIATION",
+  "description": "Daily cash reconciliation between bank balance and fund ledger balance.",
+  "rulesConfig": {
+    "varianceTolerance": 1000.00,
+    "requiredInputs": [...],
+    "requiredEvidence": ["rec_file"],
+    "escalationCriteria": ["variance_exceeds_tolerance"],
+    "aiModel": "gpt-4o-mini"
+  },
+  "slaConfig": {
+    "dueTimeOfDay": "16:00:00",
+    "maxCompletionDelayMinutes": 0,
+    "defaultReviewerRole": "OPS"
+  }
+}
+```
+
+All fields are validated against the `CreateCaseTypeInputSchema` Zod schema before the record is written. `varianceTolerance` must be a non-negative number; `dueTimeOfDay` must match `HH:MM:SS`; `maxCompletionDelayMinutes` must be a non-negative integer.
+
+## How rulesConfig is snapshotted into the audit log
+
+When an AI suggestion is generated, the backend writes an `AI_SUGGESTION_GENERATED` audit entry that includes a `rulesSnapshot` field — a copy of the case type's `rulesConfig` at the moment the suggestion was produced. This means you can always answer the question "which rules were in effect when the AI made this call?" even if the case type has been updated since.
+
+```json
+{
+  "actionType": "AI_SUGGESTION_GENERATED",
+  "details": {
+    "aiSuggestion": { ... },
+    "rulesSnapshot": {
+      "varianceTolerance": 1000.00,
+      "requiredInputs": [...],
+      ...
+    }
+  }
+}
+```
+
+<Tip>
+  The case type schema is deliberately generic. The same `rulesConfig` + `slaConfig` structure works for any operational workflow, not just cash reconciliation. To add a new workflow type — for example `SUB_DOC_REVIEW`, `ALLOCATION_REVIEW`, or `VENDOR_ACCESS_GRANT` — create a new case type with its own tolerance, required inputs, and SLA deadline. No code changes are required; each case type's rules are evaluated at runtime by the AI provider.
+</Tip>

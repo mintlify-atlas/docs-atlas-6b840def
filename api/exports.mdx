@@ -1,0 +1,94 @@
+---
+title: "Export API: download cases and audit logs as CSV"
+description: "Download case and audit log data as CSV via GET /export/cases.csv and GET /export/audit-logs.csv. Both endpoints require from and to date range parameters."
+---
+
+The export endpoints produce RFC 4180–compliant CSV files covering any date range — designed to be handed directly to an SEC examiner or LP due-diligence reviewer. Both endpoints are served by the same `exportService` formatter that the CLI uses, so the output is identical whether you call the API or run `npm run export`.
+
+## GET /export/cases.csv
+
+Downloads all cases with a `businessDate` in the requested range, including full AI suggestion and reviewer decision data.
+
+```bash
+curl "http://localhost:4000/export/cases.csv?from=2026-01-01&to=2026-12-31" \
+  -o cases.csv
+```
+
+**Query parameters:**
+
+<ParamField query="from" type="string" required>
+  ISO date string for the start of the range (inclusive). Filters by `businessDate`.
+</ParamField>
+
+<ParamField query="to" type="string" required>
+  ISO date string for the end of the range (inclusive). Filters by `businessDate`.
+</ParamField>
+
+**Response:** `Content-Type: text/csv` with `Content-Disposition: attachment; filename="cases-<from>-to-<to>.csv"`.
+
+**Columns in `cases.csv`:**
+
+| Column | Description |
+|---|---|
+| `caseId` | Unique case identifier |
+| `businessDate` | The business date the case covers |
+| `caseType` | Name of the case type |
+| `status` | Final status: `OPEN`, `UNDER_REVIEW`, `APPROVED`, `ESCALATED`, or `CLOSED` |
+| `slaBreached` | `true` or `false` |
+| `dueAt` | ISO timestamp of the SLA deadline |
+| `createdAt` | ISO timestamp of case creation |
+| `createdBy` | Name of the user who created the case |
+| `reviewer` | Name of the reviewer who finalized the case (blank if not finalized) |
+| `inputs` | JSON-serialized case inputs (bank balance, ledger balance, variance, etc.) |
+| `aiSuggestedStatus` | `OK` or `ESCALATE` (blank if no AI suggestion) |
+| `aiExplanation` | AI explanation text |
+| `aiModel` | Model name used (e.g. `gpt-4o` or `rule-based:cash-rec`) |
+| `aiRunId` | Unique run ID for the AI call |
+| `reviewerFinalStatus` | `APPROVED` or `ESCALATED` (blank if not finalized) |
+| `reviewerDecisionNote` | Reviewer's written decision note |
+| `reviewerDecidedAt` | ISO timestamp of the reviewer decision |
+
+## GET /export/audit-logs.csv
+
+Downloads all audit log entries with a `timestamp` in the requested range.
+
+```bash
+curl "http://localhost:4000/export/audit-logs.csv?from=2026-01-01&to=2026-12-31" \
+  -o audit-logs.csv
+```
+
+**Query parameters:**
+
+<ParamField query="from" type="string" required>
+  ISO date string for the start of the range (inclusive). Filters by `timestamp`.
+</ParamField>
+
+<ParamField query="to" type="string" required>
+  ISO date string for the end of the range (inclusive). Filters by `timestamp`.
+</ParamField>
+
+**Columns in `audit-logs.csv`:**
+
+| Column | Description |
+|---|---|
+| `auditId` | Unique audit log entry identifier |
+| `caseId` | ID of the case this entry belongs to |
+| `timestamp` | ISO timestamp of the action |
+| `actorType` | `USER`, `AI`, or `SYSTEM` |
+| `actorId` | User ID for USER actors; blank for AI/SYSTEM |
+| `actionType` | One of the five action types |
+| `details` | JSON-serialized details object |
+
+<Tip>
+You can produce the same two files using the CLI without making HTTP requests:
+
+```bash
+npm run export -- --from 2026-01-01 --to 2026-12-31 --out ./out
+```
+
+This writes `out/cases.csv` and `out/audit-logs.csv`. See [Export CLI](/compliance/export-cli) for full CLI documentation.
+</Tip>
+
+<Note>
+Both endpoints use the same underlying `exportService` formatter — the API and CLI produce identical output. The `from`/`to` parameters filter by `businessDate` for cases and by `timestamp` for audit logs.
+</Note>

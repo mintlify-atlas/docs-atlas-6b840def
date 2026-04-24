@@ -1,0 +1,132 @@
+---
+title: "Authenticating API requests with the x-user-id header"
+description: "How to authenticate requests using the x-user-id header, what each role (ANALYST, OPS, CCO, ADMIN) can do, and how the middleware enforces access."
+---
+
+The API uses a demo-grade authentication model: include the `x-user-id` header on every request and the `authMiddleware` in `backend/src/middleware/auth.ts` resolves it to a `User` record from the database and attaches it to `req.user`. No session, no token, no IdP — just the header and a database lookup. Replacing this mechanism with a real identity provider is a single-file change; the `req.user` shape and all downstream `requireRole` gates remain unchanged.
+
+<Warning>
+  Do not use the `x-user-id` header pattern in production. It performs no signature verification, no expiry check, and no token validation. Any caller who knows a user's UUID can act with that user's role. This header exists solely to demonstrate the role-gate controls without the overhead of a full auth stack.
+</Warning>
+
+## How the middleware works
+
+The `authMiddleware` runs on every request before any route handler. It reads the `x-user-id` header, queries the database for a matching `User` record, and — if found — sets `req.user`:
+
+```typescript
+export async function authMiddleware(
+  req: Request,
+  _res: Response,
+  next: NextFunction,
+): Promise<void> {
+  const headerVal = req.header("x-user-id");
+  if (!headerVal) {
+    next();
+    return;
+  }
+  const user = await prisma.user.findUnique({ where: { id: headerVal } });
+  if (user) {
+    req.user = {
+      id: user.id,
+      name: user.name,
+      email: user.email,
+      role: user.role as Role,
+    };
+  }
+  next();
+}
+```
+
+If the header is absent or the UUID does not match any user, `req.user` is left undefined and the request continues unauthenticated. Routes that require a known user call either `requireAuth` (which returns `401`) or `requireRole` (which returns `401` for no user and `403` for a wrong role).
+
+## Making an authenticated request
+
+Pass the user's UUID as the `x-user-id` header. Use `GET /users` to retrieve the IDs of the four seeded demo users:
+
+```bash
+# Retrieve the user list to find a valid UUID
+curl http://localhost:4000/users
+
+# Make an authenticated request as that user
+curl -H "x-user-id: <userId>" http://localhost:4000/cases
+```
+
+<ParamField header="x-user-id" type="string" required>
+  The UUID of a `User` record in the database. The middleware performs a `findUnique` lookup and populates `req.user` with `id`, `name`, `email`, and `role`. If the value is not a valid UUID or does not match any user, the request proceeds unauthenticated.
+</ParamField>
+
+## User roles
+
+Four roles are defined in `shared/src/types.ts`. Each role unlocks a specific set of endpoints.
+
+```typescript
+export type Role = "ANALYST" | "OPS" | "CCO" | "ADMIN";
+```
+
+| Role | Can do |
+|------|--------|
+| `ANALYST` | Create cases, update case inputs, trigger AI suggestions |
+| `OPS` | Everything ANALYST can do, plus submit reviewer decisions (`APPROVED` or `ESCALATED`) |
+| `CCO` | Everything OPS can do, plus create case types |
+| `ADMIN` | Create case types |
+
+The role gate is enforced by `requireRole` in `backend/src/middleware/requireRole.ts`. It checks `req.user.role` against the list of allowed roles for the route and returns an error if the role does not match:
+
+```typescript
+export function requireRole(...allowed: Role[]) {
+  return (req: Request, res: Response, next: NextFunction): void => {
+    if (!req.user) {
+      res.status(401).json({ error: "Unauthenticated." });
+      return;
+    }
+    if (!allowed.includes(req.user.role)) {
+      res.status(403).json({
+        error: `Forbidden. Required role(s): ${allowed.join(", ")}. Current: ${req.user.role}.`,
+      });
+      return;
+    }
+    next();
+  };
+}
+```
+
+## Seeded demo users
+
+Running `npm run seed` creates four users that cover all four roles. Use the `GET /users` endpoint to retrieve their current UUIDs (UUIDs are generated at seed time and differ between databases).
+
+| Name | Email | Role | What they can do in the demo |
+|------|-------|------|------------------------------|
+| Ava Analyst | ava.analyst@fund.example | `ANALYST` | Create cases, update inputs, trigger AI suggestions |
+| Omar Ops | omar.ops@fund.example | `OPS` | Everything Ava can do, plus submit `APPROVED` or `ESCALATED` decisions |
+| Casey CCO | casey.cco@fund.example | `CCO` | Everything Omar can do, plus create case types |
+| Alex Admin | alex.admin@fund.example | `ADMIN` | Create case types |
+
+In the frontend UI, the **Acting as** dropdown in the top-right corner sets the `x-user-id` header for every request. Switching users changes which action buttons are enabled in the interface.
+
+## Missing header: unauthenticated requests
+
+If the `x-user-id` header is absent, `req.user` is undefined. Most `GET` endpoints — cases, case types, audit logs, exports — do not require a user and respond normally. Routes that call `requireAuth` return:
+
+```json
+{
+  "error": "Unauthenticated. Provide x-user-id header."
+}
+```
+
+with HTTP status `401`.
+
+## Wrong role: forbidden requests
+
+If the header is present and resolves to a valid user, but the user's role does not satisfy the route's `requireRole` gate, the response is:
+
+```json
+{
+  "error": "Forbidden. Required role(s): OPS, CCO. Current: ANALYST."
+}
+```
+
+with HTTP status `403`. For example, an `ANALYST` calling `POST /cases/:id/reviewer-decision` receives this response because that endpoint requires `OPS` or `CCO`.
+
+<Note>
+  The `x-user-id` mechanism is intentionally thin so the role-gate controls are easy to read and audit. Replacing it with a real IdP — OAuth 2.0, OIDC, or a session layer — requires changes to a single file: `backend/src/middleware/auth.ts`. The `req.user` shape, the `requireRole` middleware, and every route that reads `req.user` remain unchanged.
+</Note>

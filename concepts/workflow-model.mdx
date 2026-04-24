@@ -1,0 +1,85 @@
+---
+title: "Workflow model: cases, states, and transitions"
+description: "The case-based workflow model, the five-status lifecycle from OPEN to a final state, and how CaseType parameterizes the entire workflow as data."
+---
+
+Every run of a workflow in the cash reconciliation system is represented as a **Case**. When an analyst submits today's bank-vs-ledger numbers, the system creates one Case record, attaches inputs and metadata to it, and then advances it through a defined sequence of statuses until a reviewer finalizes it. The Case is the unit of work, the unit of record, and the unit an examiner inspects.
+
+## The Case type
+
+The `Case` interface lives in `shared/src/types.ts` and is the shared contract used by both the backend and the frontend:
+
+```typescript
+export interface Case {
+  id: string;
+  caseTypeId: string;
+  caseType?: CaseType;
+  businessDate: string;
+  status: CaseStatus;
+  createdAt: string;
+  updatedAt: string;
+  createdByUserId: string;
+  createdBy?: User;
+  reviewerUserId: string | null;
+  reviewer?: User | null;
+  inputs: Record<string, unknown>;
+  aiSuggestion: AiSuggestion | null;
+  reviewerDecision: ReviewerDecision | null;
+  dueAt: string;
+  slaBreached: boolean;
+}
+```
+
+Two fields deserve attention up front. `dueAt` is computed at creation time from the case type's SLA configuration and never changes afterward — it is the deadline the reviewer must beat. `slaBreached` is a boolean flag that is set permanently at decision time if that deadline was missed; it does not reset if the case is later re-examined.
+
+## Status lifecycle
+
+A case moves through at most five statuses. The normal path is `OPEN → UNDER_REVIEW → APPROVED` or `OPEN → UNDER_REVIEW → ESCALATED`. The transition to `UNDER_REVIEW` happens automatically when the AI suggestion endpoint runs; the transition to a final status requires a human reviewer with the `OPS` or `CCO` role.
+
+| Status | Description |
+|--------|-------------|
+| `OPEN` | Case created, inputs submitted, no AI suggestion yet. |
+| `UNDER_REVIEW` | AI suggestion has been generated. The case is awaiting a reviewer decision. |
+| `APPROVED` | A reviewer with the required role has approved the case. This is a final state. |
+| `ESCALATED` | A reviewer has escalated the case (or the AI recommended escalation and the reviewer confirmed). This is a final state. |
+| `CLOSED` | Reserved status defined in the type system. |
+
+<Info>
+`CLOSED` is a valid member of the `CaseStatus` union and is present in the Zod schema, but it is not currently used in any finalization flow. No route or service transitions a case to `CLOSED`. The status exists as an extension point for future workflows that need a distinct post-finalization close step.
+</Info>
+
+## CaseType: policy as data
+
+The workflow definition is not hardcoded — it lives in the `CaseType` model as two JSON columns: `rulesConfig` and `slaConfig`. When you create a case, the backend fetches the case type, reads these configs, and applies them to validate inputs, compute `dueAt`, and inform the AI provider.
+
+```typescript
+export interface CaseType {
+  id: string;
+  name: string;
+  description: string;
+  rulesConfig: RulesConfig;
+  slaConfig: SlaConfig;
+}
+
+export interface RulesConfig {
+  varianceTolerance: number;
+  requiredInputs: FieldDefinition[];
+  requiredEvidence: string[];
+  escalationCriteria: string[];
+  aiModel: string;
+}
+
+export interface SlaConfig {
+  dueTimeOfDay: string; // "16:00:00"
+  maxCompletionDelayMinutes: number;
+  defaultReviewerRole: Role;
+}
+```
+
+Storing the workflow definition as data rather than code means you can add new case types — subscription document review, allocation review, vendor access grants — without changing any application logic. Each case type gets its own rules and SLA thresholds.
+
+## Workflow snapshot at creation
+
+When a case is created, `caseService.ts` immediately snapshots both `rulesConfig` and `slaConfig` into the `CASE_CREATED` audit entry. This means a historical case remains fully explainable even if the case type's policy is later updated. The audit entry always reflects the rules that were actually in effect when the case was created and when the AI ran, not the current policy.
+
+This is why the `details` field of a `CASE_CREATED` audit row contains `rulesSnapshot`, `slaSnapshot`, and `dueAt` as explicit fields rather than just a reference to the case type ID.

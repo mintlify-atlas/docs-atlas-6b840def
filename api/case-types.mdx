@@ -1,0 +1,156 @@
+---
+title: "Case types API: list and create workflow definitions"
+description: "List and create CaseType workflow definitions via /case-types. Each type holds the rulesConfig and slaConfig that parameterize the reconciliation workflow."
+---
+
+Case types are the workflow definitions that parameterize every case — they hold the variance tolerance, required inputs, SLA deadline, and the AI model to use. The `/case-types` endpoints let you list existing types and create new ones (ADMIN or CCO role required for creation).
+
+## GET /case-types
+
+Returns all case types ordered by name. No authentication required.
+
+```bash
+curl http://localhost:4000/case-types
+```
+
+**Response** — array of `CaseType` objects:
+
+<ResponseField name="id" type="string">
+  Unique identifier (cuid).
+</ResponseField>
+
+<ResponseField name="name" type="string">
+  Human-readable name, e.g. `"Daily Cash Reconciliation"`.
+</ResponseField>
+
+<ResponseField name="description" type="string">
+  Free-text description of the workflow this type covers.
+</ResponseField>
+
+<ResponseField name="rulesConfig" type="object">
+  Parsed rules configuration. See fields below.
+  <Expandable title="rulesConfig properties">
+    <ResponseField name="varianceTolerance" type="number">
+      Maximum acceptable variance (absolute value). Variances above this threshold trigger an ESCALATE suggestion.
+    </ResponseField>
+    <ResponseField name="requiredInputs" type="FieldDefinition[]">
+      Fields that must be present when creating or updating a case.
+    </ResponseField>
+    <ResponseField name="requiredEvidence" type="string[]">
+      List of evidence descriptions required before a case can be approved.
+    </ResponseField>
+    <ResponseField name="escalationCriteria" type="string[]">
+      Human-readable criteria that the AI uses to decide when to escalate.
+    </ResponseField>
+    <ResponseField name="aiModel" type="string">
+      Model identifier passed to the AI provider (e.g. `"gpt-4o"`).
+    </ResponseField>
+  </Expandable>
+</ResponseField>
+
+<ResponseField name="slaConfig" type="object">
+  Parsed SLA configuration.
+  <Expandable title="slaConfig properties">
+    <ResponseField name="dueTimeOfDay" type="string">
+      Time by which the case must be decided, in `HH:MM:SS` format (e.g. `"16:00:00"`).
+    </ResponseField>
+    <ResponseField name="maxCompletionDelayMinutes" type="number">
+      Additional grace period in minutes after `dueTimeOfDay` before a breach is recorded.
+    </ResponseField>
+    <ResponseField name="defaultReviewerRole" type="string">
+      Role expected to finalize cases of this type (`OPS` or `CCO`).
+    </ResponseField>
+  </Expandable>
+</ResponseField>
+
+## GET /case-types/:id
+
+Returns a single case type by ID. No authentication required.
+
+```bash
+curl http://localhost:4000/case-types/clxyz123
+```
+
+Returns 404 if the case type does not exist.
+
+## POST /case-types
+
+Creates a new case type. Requires role **ADMIN** or **CCO**.
+
+```bash
+curl -X POST http://localhost:4000/case-types \
+  -H "Content-Type: application/json" \
+  -H "x-user-id: <adminOrCcoUserId>" \
+  -d '{
+    "name": "Daily Cash Reconciliation",
+    "description": "End-of-day reconciliation between bank and ledger balance.",
+    "rulesConfig": {
+      "varianceTolerance": 1000,
+      "requiredInputs": [
+        { "name": "bankBalance", "label": "Bank Balance", "type": "number", "required": true },
+        { "name": "ledgerBalance", "label": "Ledger Balance", "type": "number", "required": true },
+        { "name": "variance", "label": "Variance", "type": "number", "required": true }
+      ],
+      "requiredEvidence": ["Bank statement PDF", "Ledger extract"],
+      "escalationCriteria": ["Variance exceeds tolerance", "Missing required evidence"],
+      "aiModel": "gpt-4o"
+    },
+    "slaConfig": {
+      "dueTimeOfDay": "16:00:00",
+      "maxCompletionDelayMinutes": 0,
+      "defaultReviewerRole": "OPS"
+    }
+  }'
+```
+
+**Request body fields:**
+
+<ParamField body="name" type="string" required>
+  Unique name for the case type. Must be at least 1 character.
+</ParamField>
+
+<ParamField body="description" type="string" required>
+  Description of the workflow this case type covers.
+</ParamField>
+
+<ParamField body="rulesConfig" type="object" required>
+  Rules that govern case validation and AI suggestion.
+  <Expandable title="rulesConfig fields">
+    <ParamField body="varianceTolerance" type="number" required>
+      Non-negative number. Variances above this value trigger an ESCALATE suggestion.
+    </ParamField>
+    <ParamField body="requiredInputs" type="FieldDefinition[]" required>
+      Array of field definitions. Each has `name` (string), `label` (string), `type` (`number|string|date|file`), and `required` (boolean).
+    </ParamField>
+    <ParamField body="requiredEvidence" type="string[]" required>
+      List of evidence item descriptions required for the case.
+    </ParamField>
+    <ParamField body="escalationCriteria" type="string[]" required>
+      Criteria used by the AI to determine whether to recommend ESCALATE.
+    </ParamField>
+    <ParamField body="aiModel" type="string" required>
+      Model identifier for the AI provider (e.g. `"gpt-4o"`). Ignored when using the rule-based provider.
+    </ParamField>
+  </Expandable>
+</ParamField>
+
+<ParamField body="slaConfig" type="object" required>
+  SLA deadline configuration.
+  <Expandable title="slaConfig fields">
+    <ParamField body="dueTimeOfDay" type="string" required>
+      Time of day by which cases must be decided, in `HH:MM:SS` format.
+    </ParamField>
+    <ParamField body="maxCompletionDelayMinutes" type="number" required>
+      Grace period in minutes after `dueTimeOfDay`. Set to `0` for no grace period.
+    </ParamField>
+    <ParamField body="defaultReviewerRole" type="string" required>
+      Role expected to review cases: `"OPS"` or `"CCO"`.
+    </ParamField>
+  </Expandable>
+</ParamField>
+
+Returns `201` with the created `CaseType` object on success.
+
+<Tip>
+The `rulesConfig` and `slaConfig` you set here are snapshotted into every audit row at case creation time — so historical decisions remain explainable even after you update the case type.
+</Tip>

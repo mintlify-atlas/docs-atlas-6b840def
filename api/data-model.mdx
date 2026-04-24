@@ -1,0 +1,409 @@
+---
+title: "Data model: cases, audit logs, and case types"
+description: "Four database models — User, CaseType, Case, and AuditLog — and how they relate: roles, JSON configs, status lifecycle, and append-only audit entries."
+---
+
+The data layer is four models and no cleverness. `User` holds role assignments. `CaseType` stores the workflow definition — rules and SLA policy — as serialized JSON. `Case` is one run of a workflow, carrying inputs, an optional AI suggestion, and an optional reviewer decision alongside its status and SLA fields. `AuditLog` is append-only: every state transition and every AI call writes exactly one row in the same database transaction as the state change. Because SQLite does not support native enum columns, all enum-like fields (`role`, `status`, `actorType`, `actionType`) are stored as plain strings and validated at the application layer by the Zod schemas in `shared/src/schemas.ts`.
+
+## Full Prisma schema
+
+```prisma
+// Prisma schema for the SEC-aware cash reconciliation demo.
+// Enum-like fields are stored as String because SQLite doesn't support enums;
+// they are validated at the application layer via Zod (see shared/src/schemas.ts).
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id            String     @id @default(cuid())
+  name          String
+  email         String     @unique
+  role          String
+  createdAt     DateTime   @default(now())
+
+  casesCreated  Case[]     @relation("createdBy")
+  casesReviewed Case[]     @relation("reviewedBy")
+}
+
+model CaseType {
+  id          String   @id @default(cuid())
+  name        String   @unique
+  description String
+  rulesConfig String
+  slaConfig   String
+  createdAt   DateTime @default(now())
+
+  cases       Case[]
+}
+
+model Case {
+  id                String     @id @default(cuid())
+  caseType          CaseType   @relation(fields: [caseTypeId], references: [id])
+  caseTypeId        String
+  businessDate      DateTime
+  status            String     @default("OPEN")
+  createdAt         DateTime   @default(now())
+  updatedAt         DateTime   @updatedAt
+
+  createdBy         User       @relation("createdBy", fields: [createdByUserId], references: [id])
+  createdByUserId   String
+
+  reviewer          User?      @relation("reviewedBy", fields: [reviewerUserId], references: [id])
+  reviewerUserId    String?
+
+  inputs            String
+  aiSuggestion      String?
+  reviewerDecision  String?
+
+  dueAt             DateTime
+  slaBreached       Boolean    @default(false)
+
+  auditLogs         AuditLog[]
+
+  @@index([businessDate])
+  @@index([status])
+  @@index([caseTypeId])
+}
+
+model AuditLog {
+  id         String   @id @default(cuid())
+  case       Case     @relation(fields: [caseId], references: [id])
+  caseId     String
+  timestamp  DateTime @default(now())
+  actorType  String
+  actorId    String?
+  actionType String
+  details    String
+
+  @@index([caseId, timestamp])
+  @@index([timestamp])
+}
+```
+
+<Note>
+**SQLite vs Postgres:** to switch to Postgres, change `provider = "sqlite"` to `provider = "postgresql"` in `schema.prisma` and update `DATABASE_URL` in `backend/.env`. Migrations already exist and will apply cleanly with `prisma migrate deploy`.
+</Note>
+
+---
+
+## Indexes
+
+The schema defines five composite and single-column indexes.
+
+| Index | Columns | What it speeds up |
+|---|---|---|
+| `Case` | `businessDate` | Date-range filters on the case list (`from` / `to` query params) |
+| `Case` | `status` | Filtering by `status` on the case list |
+| `Case` | `caseTypeId` | Filtering cases by workflow type |
+| `AuditLog` | `(caseId, timestamp)` | Fetching the full ordered audit trail for a single case |
+| `AuditLog` | `timestamp` | Cross-case compliance pulls by date range (`GET /audit-logs`) |
+
+---
+
+## User
+
+Every request carries an `x-user-id` header that the auth middleware resolves to a `User` row. The `role` field controls what actions a user can take: only `OPS` and `CCO` can submit a reviewer decision; only `ADMIN` and `CCO` can create case types.
+
+<Note>
+`role` is stored as a plain `String` in SQLite. The Zod `RoleSchema` (`z.enum(["ANALYST", "OPS", "CCO", "ADMIN"])`) enforces the allowed values at the application layer on every write path.
+</Note>
+
+<ResponseField name="id" type="string" required>
+  CUID. Primary key.
+</ResponseField>
+
+<ResponseField name="name" type="string" required>
+  Display name shown in the UI and recorded in audit entries.
+</ResponseField>
+
+<ResponseField name="email" type="string" required>
+  Unique email address.
+</ResponseField>
+
+<ResponseField name="role" type="string" required>
+  One of `ANALYST`, `OPS`, `CCO`, or `ADMIN`. Validated by `RoleSchema` at the app layer.
+</ResponseField>
+
+<ResponseField name="createdAt" type="datetime" required>
+  Row creation timestamp. Set by the database default.
+</ResponseField>
+
+---
+
+## CaseType
+
+A `CaseType` row is the workflow definition. It carries `rulesConfig` — the tolerance, required fields, AI model selection, and escalation criteria — and `slaConfig` — the due time and maximum delay. Both are stored as serialized JSON strings in SQLite and parsed at runtime against their Zod schemas (`RulesConfigSchema` and `SlaConfigSchema`). This means the policy lives as data, not code, and historical decisions remain explainable even after the policy is updated, because audit entries snapshot the config at invocation time.
+
+<ResponseField name="id" type="string" required>
+  CUID. Primary key.
+</ResponseField>
+
+<ResponseField name="name" type="string" required>
+  Unique human-readable name for the workflow type (e.g., `"Daily Cash Reconciliation"`).
+</ResponseField>
+
+<ResponseField name="description" type="string" required>
+  Free-text description of the workflow's purpose.
+</ResponseField>
+
+<ResponseField name="rulesConfig" type="string (serialized JSON)" required>
+  Stored as a JSON string; parsed and validated against `RulesConfigSchema` at runtime. See the [`RulesConfig` interface](/api/schemas#rulesconfigschema) for the full shape.
+
+  <Expandable title="RulesConfig properties">
+    <ResponseField name="varianceTolerance" type="number" required>
+      Maximum acceptable absolute variance before the AI flags for escalation.
+    </ResponseField>
+    <ResponseField name="requiredInputs" type="FieldDefinition[]" required>
+      Array of field definitions that must be present on the case inputs. Each entry has `name`, `label`, `type` (`"number" | "string" | "date" | "file"`), and `required`.
+    </ResponseField>
+    <ResponseField name="requiredEvidence" type="string[]" required>
+      Labels of evidence documents that must be attached before finalization.
+    </ResponseField>
+    <ResponseField name="escalationCriteria" type="string[]" required>
+      Human-readable criteria strings the AI uses when deciding whether to recommend escalation.
+    </ResponseField>
+    <ResponseField name="aiModel" type="string" required>
+      Model identifier passed to the AI provider (e.g., `"gpt-4o"`). Snapshotted into every `AI_SUGGESTION_GENERATED` audit entry.
+    </ResponseField>
+  </Expandable>
+</ResponseField>
+
+<ResponseField name="slaConfig" type="string (serialized JSON)" required>
+  Stored as a JSON string; parsed and validated against `SlaConfigSchema` at runtime. See the [`SlaConfig` interface](/api/schemas#slaconfigschema) for the full shape.
+
+  <Expandable title="SlaConfig properties">
+    <ResponseField name="dueTimeOfDay" type="string" required>
+      The time of day by which the case must be finalized, in `HH:MM:SS` format (e.g., `"16:00:00"`). Combined with `businessDate` at case creation to compute `dueAt`.
+    </ResponseField>
+    <ResponseField name="maxCompletionDelayMinutes" type="number" required>
+      Maximum number of minutes after `dueAt` before the SLA is considered breached.
+    </ResponseField>
+    <ResponseField name="defaultReviewerRole" type="string" required>
+      Role (`OPS` or `CCO`) that should be assigned to review cases of this type by default.
+    </ResponseField>
+  </Expandable>
+</ResponseField>
+
+<ResponseField name="createdAt" type="datetime" required>
+  Row creation timestamp.
+</ResponseField>
+
+---
+
+## Case
+
+A `Case` row is one run of a workflow. It moves through a defined status lifecycle, accumulates inputs and an AI suggestion, and is finalized by a reviewer decision. The three JSON payload fields (`inputs`, `aiSuggestion`, `reviewerDecision`) are stored as strings and deserialized when the row is serialized for API responses.
+
+### Status lifecycle
+
+```
+OPEN → UNDER_REVIEW → APPROVED
+                    → ESCALATED
+```
+
+A case starts as `OPEN` when created. It moves to `UNDER_REVIEW` when an AI suggestion is generated. A reviewer with role `OPS` or `CCO` finalizes the case by submitting a decision, setting status to either `APPROVED` or `ESCALATED`. There is no path back from a finalized state.
+
+<Info>
+`CLOSED` is a valid value in `CaseStatusSchema` but is not used by any current route. It is reserved for a future archival step.
+</Info>
+
+<ResponseField name="id" type="string" required>
+  CUID. Primary key.
+</ResponseField>
+
+<ResponseField name="caseTypeId" type="string" required>
+  Foreign key to `CaseType.id`. The related `CaseType` carries the `rulesConfig` and `slaConfig` that govern this case.
+</ResponseField>
+
+<ResponseField name="businessDate" type="datetime" required>
+  The date the reconciliation covers (e.g., the trading day). Stored as a `DateTime`; used with `slaConfig.dueTimeOfDay` to compute `dueAt`.
+</ResponseField>
+
+<ResponseField name="status" type="string" required>
+  Current status. One of `OPEN`, `UNDER_REVIEW`, `APPROVED`, `ESCALATED`. Defaults to `OPEN`. Validated by `CaseStatusSchema`.
+</ResponseField>
+
+<ResponseField name="createdAt" type="datetime" required>
+  Row creation timestamp.
+</ResponseField>
+
+<ResponseField name="updatedAt" type="datetime" required>
+  Last-modified timestamp. Updated automatically by Prisma on every write.
+</ResponseField>
+
+<ResponseField name="createdByUserId" type="string" required>
+  Foreign key to `User.id`. The user who opened the case.
+</ResponseField>
+
+<ResponseField name="reviewerUserId" type="string | null">
+  Foreign key to `User.id`. Set when a reviewer submits a decision. Null until then.
+</ResponseField>
+
+<ResponseField name="inputs" type="string (serialized JSON)" required>
+  The case's data payload. Stored as a JSON string; deserialized to `Record<string, unknown>` on read. For the built-in cash reconciliation case type, the shape is `CashReconciliationInputs` (`bankBalance`, `ledgerBalance`, `variance`, optional `recFilePath`, optional `notes`).
+</ResponseField>
+
+<ResponseField name="aiSuggestion" type="string (serialized JSON) | null">
+  Null until an AI suggestion is generated. Once set, stored as a JSON string and deserialized to `AiSuggestion` on read.
+
+  <Expandable title="AiSuggestion properties">
+    <ResponseField name="suggestedStatus" type="string" required>
+      Either `"OK"` or `"ESCALATE"`. This is a suggestion only — it never changes `Case.status` directly.
+    </ResponseField>
+    <ResponseField name="explanation" type="string" required>
+      Human-readable explanation from the AI provider.
+    </ResponseField>
+    <ResponseField name="modelName" type="string" required>
+      The model identifier used (e.g., `"gpt-4o"` or `"rule-based-v1"`). Permanently recorded.
+    </ResponseField>
+    <ResponseField name="runId" type="string" required>
+      A unique identifier for this specific AI invocation, for reproducibility.
+    </ResponseField>
+    <ResponseField name="generatedAt" type="string" required>
+      ISO timestamp of when the suggestion was generated.
+    </ResponseField>
+  </Expandable>
+</ResponseField>
+
+<ResponseField name="reviewerDecision" type="string (serialized JSON) | null">
+  Null until a reviewer submits a decision. Once set, stored as a JSON string and deserialized to `ReviewerDecision` on read.
+
+  <Expandable title="ReviewerDecision properties">
+    <ResponseField name="finalStatus" type="string" required>
+      Either `"APPROVED"` or `"ESCALATED"`. This is what sets `Case.status` to its terminal value.
+    </ResponseField>
+    <ResponseField name="decisionNote" type="string" required>
+      Required free-text note (1–2000 characters) explaining the decision. Preserved on the audit record.
+    </ResponseField>
+    <ResponseField name="decidedAt" type="string" required>
+      ISO timestamp of when the decision was submitted. Used by `slaService` to determine whether the SLA was breached.
+    </ResponseField>
+  </Expandable>
+</ResponseField>
+
+<ResponseField name="dueAt" type="datetime" required>
+  Computed at case creation by `slaService` from `businessDate` and `slaConfig.dueTimeOfDay`. Never changes after creation.
+</ResponseField>
+
+<ResponseField name="slaBreached" type="boolean" required>
+  Defaults to `false`. Set to `true` at reviewer-decision time if `decidedAt` is after `dueAt`. When `true`, a separate `SLA_BREACH_RECORDED` audit entry is written in the same transaction as `DECISION_MADE`.
+</ResponseField>
+
+---
+
+## AuditLog
+
+`AuditLog` rows are write-only. No update or delete route exists on this model. Every row is written inside the same Prisma transaction as the state change that caused it, so the audit trail and the case state are always consistent.
+
+The `actorType` field indicates who or what caused the action:
+
+- `SYSTEM` — an automated process (e.g., SLA breach detection). `actorId` is null.
+- `AI` — the AI provider. `actorId` is null.
+- `USER` — a human user. `actorId` is the `User.id` of the person who took the action.
+
+<ResponseField name="id" type="string" required>
+  CUID. Primary key.
+</ResponseField>
+
+<ResponseField name="caseId" type="string" required>
+  Foreign key to `Case.id`.
+</ResponseField>
+
+<ResponseField name="timestamp" type="datetime" required>
+  When the action occurred. Defaults to the database `now()` at insert time.
+</ResponseField>
+
+<ResponseField name="actorType" type="string" required>
+  One of `SYSTEM`, `AI`, or `USER`. Validated by `ActorTypeSchema`.
+</ResponseField>
+
+<ResponseField name="actorId" type="string | null">
+  `User.id` for `USER` actors. Always null for `SYSTEM` and `AI` actors.
+</ResponseField>
+
+<ResponseField name="actionType" type="string" required>
+  One of the five action types below. Validated by `AuditActionTypeSchema`.
+</ResponseField>
+
+<ResponseField name="details" type="string (serialized JSON)" required>
+  A JSON object whose shape varies by `actionType`. Deserialized to `Record<string, unknown>` on read. See below for what each action type records.
+</ResponseField>
+
+### `details` by action type
+
+Each `actionType` puts a specific structure in `details`. The shapes are not enforced by a Prisma column type — they are a contract maintained in `caseService.ts` and `auditService.ts`.
+
+<AccordionGroup>
+  <Accordion title="CASE_CREATED">
+    Written when a new case is opened. Contains the submitted inputs, case type name, and computed `dueAt` so the historical record is self-contained.
+
+    ```json
+    {
+      "inputs": { "bankBalance": 1000000, "ledgerBalance": 1000000, "variance": 0 },
+      "caseTypeName": "CASH_RECONCILIATION",
+      "dueAt": "2026-04-24T16:00:00.000Z"
+    }
+    ```
+  </Accordion>
+
+  <Accordion title="INPUTS_UPDATED">
+    Written when a user updates the case inputs via `PATCH /cases/:id/inputs`.
+
+    ```json
+    {
+      "previousInputs": { "bankBalance": 1000000, "ledgerBalance": 999000, "variance": 1000 },
+      "newInputs": { "bankBalance": 1000000, "ledgerBalance": 1000000, "variance": 0 }
+    }
+    ```
+  </Accordion>
+
+  <Accordion title="AI_SUGGESTION_GENERATED">
+    Written when the AI provider returns a suggestion. Snapshots the full `aiSuggestion` object and the `rulesConfig` used, so the question "which model, with which rules, produced this output?" always has a concrete answer.
+
+    ```json
+    {
+      "aiSuggestion": {
+        "suggestedStatus": "OK",
+        "explanation": "Variance of $200.00 is within the $1,000.00 tolerance.",
+        "modelName": "rule-based:CASH_RECONCILIATION",
+        "runId": "seed-run-case-2",
+        "generatedAt": "2026-04-23T09:20:00.000Z"
+      },
+      "rulesSnapshot": { "varianceTolerance": 1000, "aiModel": "gpt-4o-mini", "...": "..." }
+    }
+    ```
+  </Accordion>
+
+  <Accordion title="DECISION_MADE">
+    Written when a reviewer submits a final decision via `POST /cases/:id/reviewer-decision`. Contains the final status, decision note, decided timestamp, the prior AI suggestion for comparison, and the case's `dueAt`.
+
+    ```json
+    {
+      "finalStatus": "APPROVED",
+      "decisionNote": "Variance nominal; timing difference on one wire. Approved.",
+      "decidedAt": "2026-04-22T14:30:00.000Z",
+      "priorAiSuggestion": { "suggestedStatus": "OK", "...": "..." },
+      "dueAt": "2026-04-22T16:00:00.000Z"
+    }
+    ```
+  </Accordion>
+
+  <Accordion title="SLA_BREACH_RECORDED">
+    Written in the same transaction as `DECISION_MADE` when `decidedAt` is after `dueAt`. Actor type is `SYSTEM`; `actorId` is null.
+
+    ```json
+    {
+      "dueAt": "2026-04-24T16:00:00.000Z",
+      "decidedAt": "2026-04-24T18:45:00.000Z",
+      "delayMinutes": 165
+    }
+    ```
+  </Accordion>
+</AccordionGroup>

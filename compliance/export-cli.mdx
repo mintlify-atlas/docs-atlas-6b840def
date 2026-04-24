@@ -1,0 +1,104 @@
+---
+title: "Exporting audit logs and cases for examination"
+description: "Use the CSV export API endpoints and npm run export CLI to produce Rule 204-2 compliant records of cases and audit logs for any date range."
+---
+
+When you need to produce records for an SEC examination, an LP due-diligence request, or an internal review, the workflow gives you two entry points to the same data: an `npm run export` CLI command that writes files to disk, and two HTTP endpoints that stream the same CSVs directly. Both use the same `exportService` formatter, so the output is identical regardless of which path you use.
+
+## CLI export
+
+Run the following command from the repo root to export all cases and audit logs for a given date range:
+
+```bash
+npm run export -- --from 2026-01-01 --to 2026-12-31 --out ./out
+```
+
+The `--out` flag is optional and defaults to `./export-out`. The command creates the output directory if it does not exist.
+
+**Arguments:**
+
+| Flag | Required | Description |
+|---|---|---|
+| `--from` | Yes | Start date, inclusive (YYYY-MM-DD) |
+| `--to` | Yes | End date, inclusive (YYYY-MM-DD) |
+| `--out` | No | Output directory path (default: `./export-out`) |
+
+**Files produced:**
+
+| File | Contents |
+|---|---|
+| `out/cases.csv` | One row per case with all case-level fields, AI suggestion fields, and reviewer decision fields |
+| `out/audit-logs.csv` | One row per audit log entry, ordered by timestamp ascending |
+
+## cases.csv columns
+
+The cases export includes every field an examiner would need to reconstruct a decision: the inputs that were presented, the AI suggestion that was generated, and the human decision that finalized the case.
+
+| Column | Description |
+|---|---|
+| `caseId` | Unique case identifier |
+| `businessDate` | The business date the case was created for |
+| `caseType` | Name of the case type (e.g., `Daily Cash Rec`) |
+| `status` | Final case status (`OPEN`, `UNDER_REVIEW`, `APPROVED`, `ESCALATED`, `CLOSED`) |
+| `slaBreached` | `true` if the SLA was breached, `false` otherwise |
+| `dueAt` | SLA deadline timestamp |
+| `createdAt` | Case creation timestamp |
+| `createdBy` | Name of the user who created the case |
+| `reviewer` | Name of the user who submitted the reviewer decision |
+| `inputs` | JSON blob of the case inputs (balances, variance, evidence path) |
+| `aiSuggestedStatus` | Status the AI suggested (`OK`, `ESCALATE`, or empty) |
+| `aiExplanation` | The AI's explanation for its suggestion |
+| `aiModel` | Model name that produced the suggestion (e.g., `gpt-4o`, `rule-based-v1`) |
+| `aiRunId` | Unique run identifier for the AI call |
+| `reviewerFinalStatus` | Status the reviewer chose at finalization |
+| `reviewerDecisionNote` | Free-text note the reviewer entered at decision time |
+| `reviewerDecidedAt` | Timestamp of the reviewer's decision |
+
+## audit-logs.csv columns
+
+The audit log export is an ordered record of every action taken on every case in the date range. Because the audit log is append-only, this file is the authoritative record of what happened and when.
+
+| Column | Description |
+|---|---|
+| `auditId` | Unique audit entry identifier |
+| `caseId` | The case this entry belongs to |
+| `timestamp` | When the action occurred (ISO 8601) |
+| `actorType` | `USER`, `AI`, or `SYSTEM` |
+| `actorId` | User ID of the actor (empty for system-generated entries) |
+| `actionType` | One of: `CASE_CREATED`, `INPUTS_UPDATED`, `AI_SUGGESTION_GENERATED`, `DECISION_MADE`, `SLA_BREACH_RECORDED` |
+| `details` | JSON blob with action-specific fields (snapshot of rules, model metadata, decision note, etc.) |
+
+## HTTP export endpoints
+
+You can also pull the same CSVs over HTTP. Both endpoints accept `from` and `to` as ISO date query parameters.
+
+```
+GET /export/cases.csv?from=2026-01-01&to=2026-12-31
+GET /export/audit-logs.csv?from=2026-01-01&to=2026-12-31
+```
+
+**curl examples:**
+
+```bash
+# Export cases for a full year
+curl "http://localhost:4000/export/cases.csv?from=2026-01-01&to=2026-12-31" \
+  -H "x-user-id: user_ops_1" \
+  -o cases.csv
+
+# Export audit logs for a single month
+curl "http://localhost:4000/export/audit-logs.csv?from=2026-03-01&to=2026-03-31" \
+  -H "x-user-id: user_ops_1" \
+  -o audit-logs.csv
+```
+
+The `x-user-id` header identifies the requesting user in the demo auth setup. In a production deployment with a real IdP, replace this with a bearer token or session cookie.
+
+## One formatter, two entry points
+
+The CLI (`backend/src/scripts/export.ts`) and the HTTP routes both call `exportCasesCsv` and `exportAuditLogsCsv` from `backend/src/services/exportService.ts`. There is no separate formatting logic for the CLI path. If you verify the HTTP output, you have verified the CLI output, and vice versa.
+
+The formatter follows RFC 4180: fields containing commas, quotes, or newlines are wrapped in double quotes, and embedded double quotes are doubled. JSON objects (such as `inputs` and `details`) are serialized to a single JSON string within the field.
+
+<Tip>
+  When preparing examination materials, use the SLA filter on the Case List before running the export to confirm which cases in your date range had SLA breaches. The `slaBreached` column in `cases.csv` and the `SLA_BREACH_RECORDED` entries in `audit-logs.csv` will correspond exactly to what you see in the filtered UI.
+</Tip>

@@ -1,0 +1,93 @@
+---
+title: "Audit logs API: compliance queries by date range"
+description: "Query the append-only audit log via GET /audit-logs. Filter by date range or case ID to pull the exact records an examiner or LP would request."
+---
+
+The audit log is the compliance core of the workflow — every state change and every AI call writes an immutable row. The `GET /audit-logs` endpoint lets you query those rows by date range or case ID, returning the records in chronological order. No authentication is required to read the audit log.
+
+## GET /audit-logs
+
+Returns audit log entries matching the given filters, ordered by `timestamp` ascending.
+
+```bash
+curl "http://localhost:4000/audit-logs?from=2026-01-01&to=2026-12-31"
+```
+
+**Query parameters:**
+
+<ParamField query="from" type="string">
+  ISO date string (e.g. `2026-01-01`). Filters entries with `timestamp >= from`.
+</ParamField>
+
+<ParamField query="to" type="string">
+  ISO date string (e.g. `2026-12-31`). Filters entries with `timestamp <= to`.
+</ParamField>
+
+<ParamField query="caseId" type="string">
+  Filter to entries belonging to a specific case. Combine with `from`/`to` to narrow further.
+</ParamField>
+
+**Response** — array of `AuditLogEntry` objects:
+
+<ResponseField name="id" type="string">
+  Unique identifier (cuid).
+</ResponseField>
+
+<ResponseField name="caseId" type="string">
+  ID of the case this entry belongs to.
+</ResponseField>
+
+<ResponseField name="timestamp" type="string">
+  ISO 8601 timestamp of when the action occurred.
+</ResponseField>
+
+<ResponseField name="actorType" type="string">
+  Who performed the action: `"USER"`, `"AI"`, or `"SYSTEM"`.
+</ResponseField>
+
+<ResponseField name="actorId" type="string | null">
+  User ID for `USER` actors; `null` for `AI` and `SYSTEM` actors.
+</ResponseField>
+
+<ResponseField name="actionType" type="string">
+  The event type. One of the five action types below.
+</ResponseField>
+
+<ResponseField name="details" type="object">
+  JSON object with action-specific context. Schema varies by `actionType`.
+</ResponseField>
+
+## Audit action types
+
+Each `actionType` captures a specific set of details:
+
+| actionType | actorType | Key details captured |
+|---|---|---|
+| `CASE_CREATED` | USER | `inputs`, `caseTypeName`, `rulesSnapshot`, `slaSnapshot`, `dueAt` |
+| `INPUTS_UPDATED` | USER | `previousInputs`, `newInputs` |
+| `AI_SUGGESTION_GENERATED` | AI | `aiSuggestion` (full object), `rulesSnapshot` |
+| `DECISION_MADE` | USER | `finalStatus`, `decisionNote`, `decidedAt`, `priorAiSuggestion`, `dueAt` |
+| `SLA_BREACH_RECORDED` | SYSTEM | `dueAt`, `decidedAt`, `delayMinutes` |
+
+<Note>
+Audit logs are also returned inline when you call `GET /cases/:id` — the response includes an `auditLogs` array for the full case detail view. Use `GET /audit-logs` when you need cross-case queries for a date range (e.g. for examination exports).
+</Note>
+
+## Example: pull all entries for one case
+
+```bash
+curl "http://localhost:4000/audit-logs?caseId=clxyz123"
+```
+
+## Example: pull SLA breaches for a date range
+
+Filter by `actionType` client-side after fetching:
+
+```bash
+curl "http://localhost:4000/audit-logs?from=2026-01-01&to=2026-12-31" \
+  | jq '[.[] | select(.actionType == "SLA_BREACH_RECORDED")]'
+```
+
+<Tip>
+For examination-ready exports covering a date range, use `GET /export/audit-logs.csv` or the CLI `npm run export` — they produce the same data formatted as RFC 4180 CSV.
+</Tip>

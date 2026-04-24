@@ -1,0 +1,104 @@
+---
+title: "SEC Rule 204-2 compliance design decisions"
+description: "How each design decision — append-only audit log, transactional writes, role gates, and CSV exports — maps to a specific SEC Rule 204-2 requirement."
+---
+
+The Cash Reconciliation Workflow is built around a single premise: the audit trail is the product. Every architectural choice — from the append-only log to the split between suggestion and decision endpoints — is a direct answer to a question an SEC examiner or LP due-diligence questionnaire would ask about an RIA's books and records, written procedures, and AI governance. The sections below walk through each regulatory concern and the code that addresses it.
+
+## Controls map
+
+The table below is the authoritative tour. Each row names a regulatory concern and points to the file or construct that implements it.
+
+| Concern | Where it lives |
+|---|---|
+| AI suggests, never decides | `POST /cases/:id/ai-suggestion` writes **only** to `Case.aiSuggestion` (`backend/src/routes/cases.ts`, `services/caseService.ts :: attachAiSuggestion`) |
+| Human decision is role-gated | `POST /cases/:id/reviewer-decision` sits behind `requireRole("OPS", "CCO")` (`backend/src/middleware/requireRole.ts`) |
+| State + audit are one transaction | `caseService.ts` wraps every state change in `prisma.$transaction` and calls `writeAudit` inside it (`services/auditService.ts`) |
+| Audit log is append-only | No update or delete route exists on the `AuditLog` model; `auditService.ts` exposes a write helper only |
+| AI calls are reproducible | `modelName`, `runId`, and a snapshot of `rulesConfig` land in the `AI_SUGGESTION_GENERATED` audit entry (`services/caseService.ts :: attachAiSuggestion`) |
+| Policy as data, not code | `CaseType.rulesConfig` + `slaConfig` are JSON on the case type and are snapshotted into each audit row |
+| SLA breach is first-class | `services/slaService.ts` computes `dueAt` at creation; decision time triggers a dedicated `SLA_BREACH_RECORDED` entry |
+| Examiner / LP export | `services/exportService.ts` feeds both `GET /export/*.csv` and the `npm run export` CLI — one formatter, two entry points |
+
+## The four regulatory concerns
+
+### 1. Rule 204-2 "true, accurate, current" books and records
+
+Rule 204-2 requires an investment adviser to make and keep true, accurate, and current books and records relating to its advisory business. Three implementation choices work together to satisfy this:
+
+**Append-only audit log.** The `AuditLog` model has no update or delete route. Every state change — case creation, input updates, AI suggestion, reviewer decision, SLA breach — writes a new row. The record never changes; it only grows.
+
+**Transactional writes.** `caseService.ts` wraps every state transition in a single `prisma.$transaction`. The case status update and the corresponding audit entry are committed together or not at all. You cannot have a state change without an audit row, and you cannot have an orphaned audit row without a matching state change.
+
+**CSV export API and CLI.** `GET /export/cases.csv` and `GET /export/audit-logs.csv` (and the `npm run export` CLI that calls the same formatter) produce flat files for any date range. The record is always in a form you can hand to an examiner.
+
+### 2. Policies and procedures evidence
+
+Written policies and procedures are a separate Rule 204-2 requirement, and demonstrating compliance means showing that the procedures in place *at the time of a decision* governed that decision — even if the procedures were updated afterward.
+
+`CaseType.rulesConfig` and `slaConfig` are JSON fields on the case type. They hold the workflow definition: tolerance thresholds, escalation criteria, required inputs, AI model selection, and SLA window. At the moment a case is created, those values are snapshotted into the `CASE_CREATED` audit row. At the moment an AI suggestion is generated, the active `rulesConfig` is snapshotted again into the `AI_SUGGESTION_GENERATED` row. A historical decision therefore carries its own copy of the rules that governed it.
+
+### 3. AI governance
+
+Exam staff and LP questionnaires increasingly ask three questions about AI use: What model was used? What rules governed it? Who made the final decision? The workflow answers all three.
+
+**Separate suggestion and decision endpoints.** `POST /cases/:id/ai-suggestion` can only write to `Case.aiSuggestion`. It cannot change `Case.status`. The finalization endpoint is `POST /cases/:id/reviewer-decision`, which sits behind `requireRole("OPS", "CCO")`. The split is architectural: it is not possible to skip the human.
+
+**Reproducible AI calls.** Every `AI_SUGGESTION_GENERATED` audit entry records `modelName`, `runId`, and a snapshot of the `rulesConfig` that was active when the call was made. The question "which model, with which rules, produced this output?" has a concrete, permanent answer.
+
+**Role gate on finalization.** Reviewers must be an `OPS` or `CCO` user. The `requireRole` middleware enforces this at the route level. The reviewer's identity is captured in the audit row.
+
+### 4. Exceptions visible, not buried
+
+Exceptions are what reviewers look at first. The workflow treats SLA breaches as first-class signals, not footnotes.
+
+`slaService.ts` computes `dueAt` at case creation from the case type's `slaConfig`. When a reviewer finalizes a case, the service checks the decision time against `dueAt`. If the SLA was breached, a separate `SLA_BREACH_RECORDED` audit entry is written in the same transaction as `DECISION_MADE`. The case list exposes a dedicated SLA filter so breached cases surface immediately, even when their status is `APPROVED` or `ESCALATED`.
+
+## What this deliberately is not
+
+<AccordionGroup>
+  <Accordion title="Not a reconciliation engine">
+    The reconciliation itself is two numbers and a variance. The point of this project is the workflow shell around the AI, not the math. A real cash rec engine would need to handle multi-custody feeds, break categorization, and tolerance ladders — all of which are additive to the workflow model here.
+  </Accordion>
+  <Accordion title="Not a production auth system">
+    The `x-user-id` header exists so the role gate can be demonstrated without pulling in an IdP. Swapping to a real identity provider is a single-file change (`backend/src/middleware/auth.ts`). The role gate, the audit trail, and the export format are all independent of the auth mechanism.
+  </Accordion>
+  <Accordion title="Not a real immutability guarantee">
+    Application-level append-only is the right shape for this control, but a production deployment would add database-level protections: row-level triggers preventing `UPDATE`/`DELETE` on `audit_log`, WORM storage, or a tamper-evident log such as a certificate-transparency-style Merkle log. The application is structured so adding any of these is local — it does not require restructuring the service layer.
+  </Accordion>
+  <Accordion title="Not multi-tenant or multi-fund">
+    Cases and audit logs are not scoped to a tenant or fund. Adding that scoping is a straightforward extension — a `tenantId` foreign key on `Case` and `AuditLog`, and a tenant filter on every query. It was left out to keep the compliance controls visible without fund-level noise.
+  </Accordion>
+</AccordionGroup>
+
+## Where this would go next
+
+A real v1 would need the following changes, roughly in order of leverage:
+
+<Steps>
+  <Step title="Real auth">
+    Replace `middleware/auth.ts` with an OIDC integration and a proper session layer. The role gate, middleware interface, and audit trail capture are all auth-agnostic and require no changes.
+  </Step>
+  <Step title="Postgres">
+    Change `provider` in `schema.prisma` and set `DATABASE_URL`. Migrations already exist. SQLite is the right choice for a demo; Postgres is the right choice for production row-level security and triggers.
+  </Step>
+  <Step title="File uploads for evidence">
+    Replace `recFilePath` strings on audit entries with references to object storage (S3 or equivalent), with a hash pinned on the audit row. This makes the evidence reference tamper-evident at the entry level.
+  </Step>
+  <Step title="More case types">
+    The domain model is already parameterized by `CaseType`. Adding `SUB_DOC_REVIEW`, `ALLOCATION_REVIEW`, or `VENDOR_ACCESS_GRANT` is additive — each gets its own `rulesConfig` and `slaConfig`.
+  </Step>
+  <Step title="Scheduled workflows">
+    Auto-create the daily cash-rec case at `businessDate 00:00` and attach bank and ledger feeds as inputs. The case creation path already handles this shape.
+  </Step>
+  <Step title="Notifications and SLA alerts">
+    Send Slack or email notifications when a case is nearing `dueAt`, and when a breach is recorded. The `SLA_BREACH_RECORDED` action type is the hook for this.
+  </Step>
+  <Step title="Database-level log immutability">
+    Add RLS and a trigger that prevents `UPDATE`/`DELETE` on `audit_log`, plus a periodic Merkle root signed and stored off-box.
+  </Step>
+</Steps>
+
+<Note>
+  Nothing in this documentation is legal advice. The design choices described here reflect one interpretation of what the SEC has historically scrutinized for investment advisers under Rule 204-2. Your compliance obligations depend on your specific facts, registration category, and applicable regulations. Consult qualified legal counsel before relying on any of this for regulatory purposes.
+</Note>

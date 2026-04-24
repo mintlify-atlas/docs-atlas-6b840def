@@ -1,0 +1,89 @@
+---
+title: "AI controls: suggestion without decision authority"
+description: "How the AiProvider interface constrains the AI to suggestion only, the two provider implementations, and why a separate role-gated endpoint finalizes cases."
+---
+
+The cash reconciliation system is designed so the AI can never finalize a case on its own. The AI produces a structured suggestion — a recommended status and an explanation — and that suggestion is written to the case record. A separate endpoint, guarded by a role check, is the only way to move a case to `APPROVED` or `ESCALATED`. This separation is not a convention; it is enforced by the shape of the API.
+
+## The AiProvider interface
+
+The AI layer is defined by a single interface in `backend/src/ai/AiProvider.ts`:
+
+```typescript
+export interface AiProviderInput {
+  caseType: CaseType;
+  inputs: Record<string, unknown>;
+}
+
+export interface AiProvider {
+  suggest(input: AiProviderInput): Promise<AiSuggestion>;
+}
+```
+
+The interface has exactly one method: `suggest`. There is no `decide`, no `finalize`, no `updateStatus`. Any implementation — whether it calls an LLM or evaluates rules locally — can only return an `AiSuggestion`. The type system makes it impossible for the AI layer to write a final status directly.
+
+## Two implementations
+
+The backend ships two providers, both satisfying the same interface:
+
+- **`OpenAiProvider`** — calls the OpenAI chat completions API with a structured prompt built from the case inputs and the case type's `rulesConfig`. Used when `OPENAI_API_KEY` is set in the environment.
+- **`RuleBasedProvider`** — evaluates `rulesConfig` deterministically, with no network call. Checks required inputs, required evidence, and variance tolerance. Returns `ESCALATE` if any check fails, `OK` otherwise. Its `modelName` is prefixed with `rule-based:` so the audit trail always makes clear that no LLM was involved.
+
+You can run the full demo without an API key using `RuleBasedProvider`. Switching to `OpenAiProvider` requires only setting the environment variable and restarting — no code changes.
+
+## What the AI suggestion looks like
+
+The `AiSuggestion` type is the shape both providers must return:
+
+```typescript
+export interface AiSuggestion {
+  suggestedStatus: AiSuggestedStatus; // "OK" | "ESCALATE"
+  explanation: string;
+  modelName: string;
+  runId: string;
+  generatedAt: string;
+}
+```
+
+`suggestedStatus` is either `OK` or `ESCALATE` — it maps to a recommendation, not a final case status. `modelName` records which model produced the suggestion. `runId` is a UUID generated per call. `generatedAt` is the ISO timestamp of the call. All four fields land permanently in the `AI_SUGGESTION_GENERATED` audit entry alongside a `rulesSnapshot`, so the question "which model, with which rules, produced this output?" always has a concrete answer.
+
+## What the AI endpoint does and does not do
+
+`POST /cases/:id/ai-suggestion` calls the provider, then passes control to `attachAiSuggestion` in `caseService.ts`. That function does two things inside a single `prisma.$transaction`:
+
+1. Writes the suggestion to `Case.aiSuggestion`.
+2. Advances the status from `OPEN` to `UNDER_REVIEW` if the case is currently `OPEN`.
+
+That is all. The case status after this endpoint runs is either `OPEN` (unchanged, if it was already `UNDER_REVIEW`) or `UNDER_REVIEW`. It is never `APPROVED` or `ESCALATED`.
+
+<Warning>
+The AI suggestion endpoint cannot approve or escalate a case. It has no access to the reviewer decision path and no ability to write a final status. Finalizing a case requires a call to `POST /cases/:id/reviewer-decision`, which sits behind `requireRole("OPS", "CCO")`. A user with only the `ANALYST` role can trigger AI suggestions but cannot finalize.
+</Warning>
+
+## The role gate on finalization
+
+The `requireRole` middleware enforces role-based access at the route layer:
+
+```typescript
+export function requireRole(...allowed: Role[]) {
+  return (req: Request, res: Response, next: NextFunction): void => {
+    if (!req.user) {
+      res.status(401).json({ error: "Unauthenticated." });
+      return;
+    }
+    if (!allowed.includes(req.user.role)) {
+      res.status(403).json({
+        error: `Forbidden. Required role(s): ${allowed.join(", ")}. Current: ${req.user.role}.`,
+      });
+      return;
+    }
+    next();
+  };
+}
+```
+
+`POST /cases/:id/reviewer-decision` is wrapped with `requireRole("OPS", "CCO")`. An `ANALYST` who generates a suggestion receives a `403` if they attempt to submit a decision. The AI itself has no role and no user session, so it has no path to that endpoint at all.
+
+## Reproducibility via rulesSnapshot
+
+Every `AI_SUGGESTION_GENERATED` audit entry stores a `rulesSnapshot` — a copy of the `rulesConfig` that was active at the time the AI ran. If the case type's policy is later updated, you can still reconstruct exactly what rules the AI evaluated and verify that the suggestion was reasonable under those rules. This is what makes the AI governance story auditable, not just documented.

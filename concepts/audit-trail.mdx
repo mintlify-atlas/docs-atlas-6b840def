@@ -1,0 +1,106 @@
+---
+title: "Append-only audit trail and transactional writes"
+description: "The five audit action types, atomic Prisma transaction pattern that binds state changes to audit entries, and what append-only means at the application layer."
+---
+
+Every state change in the system — creating a case, updating inputs, running the AI, finalizing a decision, recording an SLA breach — writes a row to the `AuditLog` table. That row is written inside the same database transaction as the state change it describes, so the audit entry and the state change are atomically bound: either both land or neither does. There is no application code path that updates a case without also writing an audit entry.
+
+## The AuditLogEntry type
+
+```typescript
+export interface AuditLogEntry {
+  id: string;
+  caseId: string;
+  timestamp: string;
+  actorType: ActorType;     // "SYSTEM" | "AI" | "USER"
+  actorId: string | null;
+  actionType: AuditActionType;
+  details: Record<string, unknown>;
+}
+```
+
+`actorType` distinguishes who or what produced the entry. `SYSTEM` entries are written by the server itself (for example, SLA breach detection). `AI` entries are written when the AI provider runs. `USER` entries are written when a human performs an action. `actorId` is the user ID for `USER` entries and `null` for `SYSTEM` and `AI` entries.
+
+## The five action types
+
+| `actionType` | `actorType` | Key details captured |
+|---|---|---|
+| `CASE_CREATED` | `USER` | `inputs`, `caseTypeName`, `rulesSnapshot`, `slaSnapshot`, `dueAt` |
+| `INPUTS_UPDATED` | `USER` | `previousInputs`, `newInputs` |
+| `AI_SUGGESTION_GENERATED` | `AI` | `aiSuggestion` (full object), `rulesSnapshot` |
+| `DECISION_MADE` | `USER` | `finalStatus`, `decisionNote`, `decidedAt`, `priorAiSuggestion`, `dueAt` |
+| `SLA_BREACH_RECORDED` | `SYSTEM` | `dueAt`, `decidedAt`, `delayMinutes` |
+
+`CASE_CREATED` captures snapshots of both `rulesConfig` and `slaConfig` so the record is self-contained: even after the case type is updated, you can read what the policy was at the time the case was created. `AI_SUGGESTION_GENERATED` repeats the `rulesSnapshot` for the same reason — it answers "which rules did the AI evaluate?" independently of the current policy.
+
+`DECISION_MADE` includes `priorAiSuggestion` so you can see in a single audit row what the AI recommended and what the human ultimately decided, and whether those agreed.
+
+## The transactional write pattern
+
+`writeAudit` in `auditService.ts` is designed to be called only from within an existing transaction:
+
+```typescript
+export async function writeAudit(
+  tx: Prisma.TransactionClient,
+  params: {
+    caseId: string;
+    actorType: ActorType;
+    actorId: string | null;
+    actionType: AuditActionType;
+    details: Record<string, unknown>;
+  },
+): Promise<void> {
+  await tx.auditLog.create({
+    data: {
+      caseId: params.caseId,
+      actorType: params.actorType,
+      actorId: params.actorId,
+      actionType: params.actionType,
+      details: JSON.stringify(params.details),
+    },
+  });
+}
+```
+
+The function signature requires a `Prisma.TransactionClient`, not the top-level `prisma` client. This makes it structurally impossible to call `writeAudit` outside of a `prisma.$transaction` block. Every service function that changes state follows the same pattern — open a transaction, perform the state update, call `writeAudit` with the same transaction client:
+
+```typescript
+// From caseService.ts — creating a case
+return prisma.$transaction(async (tx) => {
+  const created = await tx.case.create({ data: { ... } });
+
+  await writeAudit(tx, {
+    caseId: created.id,
+    actorType: "USER",
+    actorId: createdByUserId,
+    actionType: "CASE_CREATED",
+    details: {
+      inputs: input.inputs,
+      caseTypeName: caseType.name,
+      rulesSnapshot: caseType.rulesConfig,
+      slaSnapshot: caseType.slaConfig,
+      dueAt: dueAt.toISOString(),
+    },
+  });
+
+  return created;
+});
+```
+
+The same pattern applies in `updateCaseInputs`, `attachAiSuggestion`, and `recordReviewerDecision`. In `recordReviewerDecision`, two `writeAudit` calls can occur in the same transaction: one for `DECISION_MADE` and, if the SLA was breached, a second for `SLA_BREACH_RECORDED`.
+
+## Append-only enforcement
+
+`auditService.ts` exposes only `writeAudit` — a create-only helper. There is no `updateAudit`, no `deleteAudit`, and no route in the API that accepts a `PUT`, `PATCH`, or `DELETE` on `AuditLog` records.
+
+<Note>
+"Append-only" here means append-only **at the application layer**. Nothing in the schema or the database engine prevents a raw SQL `DELETE` against the `AuditLog` table. A production deployment would add database-level controls — row-level triggers that block `UPDATE` and `DELETE`, WORM storage, or a tamper-evident Merkle log — to close that gap. The application is structured so adding those controls is local to the database configuration and does not require changes to the service layer.
+</Note>
+
+## Reading the audit log
+
+You can retrieve audit entries in two ways:
+
+- `GET /cases/:id` returns the full case with its `auditLogs` array ordered by `timestamp` ascending — this is the view the UI renders on the Case Detail page.
+- `GET /audit-logs` accepts `from`, `to`, and `caseId` query parameters and returns entries across cases, suitable for compliance pulls over a date range.
+- `GET /export/audit-logs.csv` returns the same data as a CSV file for examiner handoff.

@@ -1,0 +1,115 @@
+---
+title: "Configuring AI providers: OpenAI and rule-based"
+description: "How to switch between the deterministic rule-based provider and OpenAI, what each provider evaluates, and how both record their output in the audit log."
+---
+
+The workflow ships with two AI providers that implement the same interface and produce the same output shape. Which one is active depends entirely on whether `OPENAI_API_KEY` is set in your `.env` file. Both providers are advisory only — they suggest a status (`OK` or `ESCALATE`), but a human reviewer always makes the final decision. Both record their output in the audit trail in an identical format, so the workflow is exam-ready regardless of which provider you use.
+
+## The AiProvider interface
+
+Both providers implement a single `suggest` method:
+
+```typescript
+interface AiProviderInput {
+  caseType: CaseType;
+  inputs: Record<string, unknown>;
+}
+
+interface AiProvider {
+  suggest(input: AiProviderInput): Promise<AiSuggestion>;
+}
+```
+
+The provider receives the case type (including its full `rulesConfig`) and the analyst's submitted inputs. It returns an `AiSuggestion`.
+
+## The AiSuggestion output shape
+
+Both providers return exactly the same structure:
+
+```typescript
+interface AiSuggestion {
+  suggestedStatus: "OK" | "ESCALATE";
+  explanation: string;   // Plain-English rationale, 1-3 sentences
+  modelName: string;     // Identifies the provider and model used
+  runId: string;         // Unique identifier for this specific invocation
+  generatedAt: string;   // ISO 8601 timestamp
+}
+```
+
+<Note>
+  The `modelName` field permanently records which provider and model produced each suggestion. For `RuleBasedProvider` it takes the form `rule-based:<caseTypeName>` (e.g. `rule-based:CASH_RECONCILIATION`). For `OpenAiProvider` it is the OpenAI model name (e.g. `gpt-4o-mini`). This value lands in the `AI_SUGGESTION_GENERATED` audit entry alongside a snapshot of the `rulesConfig`, so an examiner can always reconstruct exactly which rules and which provider produced a given output.
+</Note>
+
+## How provider selection works
+
+The backend selects a provider once at startup and caches it. The logic is straightforward:
+
+```typescript
+export function getAiProvider(): AiProvider {
+  if (cached) return cached;
+  if (env.OPENAI_API_KEY) {
+    cached = makeOpenAiProvider();
+    console.log(`[ai] using OpenAI provider (model=${env.AI_MODEL})`);
+  } else {
+    cached = new RuleBasedProvider();
+    console.log("[ai] OPENAI_API_KEY not set — using deterministic rule-based provider");
+  }
+  return cached;
+}
+```
+
+If `OPENAI_API_KEY` is present and non-empty, the OpenAI provider is used. Otherwise the rule-based provider is used.
+
+<Warning>
+  Changing `OPENAI_API_KEY` in your `.env` file requires a server restart to take effect. The provider is cached after the first call, so updating the file while the server is running has no effect until the process is restarted.
+</Warning>
+
+## RuleBasedProvider
+
+`RuleBasedProvider` is a deterministic, offline stand-in for an LLM. It requires no API key, makes no network calls, and always produces the same output for the same inputs. It is the default provider and the one used in the seeded demo data.
+
+The provider evaluates three conditions from the case type's `rulesConfig`:
+
+1. **Required inputs** — any field marked `required: true` that is missing or empty triggers an escalation reason.
+2. **Required evidence** — any key in `requiredEvidence` that has no corresponding value in the case inputs triggers an escalation reason.
+3. **Variance tolerance** — if the `variance` input is present and its absolute value exceeds `varianceTolerance`, an escalation reason is added.
+
+If any reasons were collected, `suggestedStatus` is `"ESCALATE"` and the explanation lists each reason. If no reasons were collected, `suggestedStatus` is `"OK"` and the explanation confirms the variance is within tolerance and all required data is present.
+
+Example output when variance exceeds the tolerance:
+
+```json
+{
+  "suggestedStatus": "ESCALATE",
+  "explanation": "Escalation recommended: variance of $11,600.00 exceeds tolerance of $1,000.00.",
+  "modelName": "rule-based:CASH_RECONCILIATION",
+  "runId": "3f2a1b4c-...",
+  "generatedAt": "2026-04-24T09:45:00.000Z"
+}
+```
+
+## OpenAiProvider
+
+`OpenAiProvider` calls the OpenAI chat completions API. It requires `OPENAI_API_KEY` to be set and uses the model specified by the `AI_MODEL` environment variable (default: `gpt-4o-mini`).
+
+The provider sends the case type name, description, and `rulesConfig` along with the case inputs to the model. The system prompt instructs the model to act as a compliance-aware reconciliation assistant that is advisory only, and to output strict JSON with `suggestedStatus` and `explanation` fields. The model runs at `temperature: 0` for maximum consistency.
+
+The `aiModel` field in the case type's `rulesConfig` identifies which model is expected for that case type. The provider uses `env.AI_MODEL` for the actual call. If you want different case types to record different model names in the audit trail, set `aiModel` in each case type's `rulesConfig` accordingly.
+
+Example output:
+
+```json
+{
+  "suggestedStatus": "ESCALATE",
+  "explanation": "Variance of $11,600.00 exceeds the $1,000.00 tolerance (escalation criterion: variance_exceeds_tolerance). Recommend escalation and fund admin inquiry.",
+  "modelName": "gpt-4o-mini",
+  "runId": "chatcmpl-abc123...",
+  "generatedAt": "2026-04-24T09:45:00.000Z"
+}
+```
+
+## The runId field and reproducibility
+
+Every `AiSuggestion` includes a `runId`. For `OpenAiProvider` this is the completion ID returned by the OpenAI API (e.g. `chatcmpl-abc123`). For `RuleBasedProvider` it is a randomly generated UUID.
+
+The `runId` is stored in the `AI_SUGGESTION_GENERATED` audit entry alongside the `rulesSnapshot`. Together these three values — `modelName`, `runId`, and `rulesSnapshot` — let you answer the question "which model, with which rules, produced this specific output?" for any historical case. This is the property that makes AI suggestions defensible in an audit or examiner review.

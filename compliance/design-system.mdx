@@ -1,0 +1,110 @@
+---
+title: "Ledger design system for compliance surfaces"
+description: "The Ledger design system applies institutional minimalism to compliance UIs — color tokens, typography, status palette, and WCAG AA contrast rationale."
+---
+
+The design system for the Cash Reconciliation Workflow is called Ledger. Its governing principle is institutional minimalism: the UI should read like a well-set financial statement or a filed regulatory document, not a startup dashboard. Every visual decision — typeface, color, spacing, component shape — is made to keep the record legible and the compliance evidence front and center. The tokens, component definitions, and design rationale all live in `DESIGN.md` at the repo root, in source control alongside the code.
+
+## Institutional minimalism
+
+Institutional minimalism means the visual register signals "this system is used by people who file with the SEC," not "this system is a growth product." In practice, this translates to four principles:
+
+**Gravitas, not gloss.** Serif headlines, a muted accent, no gradients, no glow effects, and no shadows on everyday panels. Elevation is conveyed through 1px hairline borders and the paper-on-desk metaphor — a white panel on a warm parchment background.
+
+**Evidence-forward.** Inputs, AI outputs, and audit entries are the content. Chrome is kept to a minimum so the record is what the eye lands on when a reviewer opens a case.
+
+**Status legibility at a glance.** Status and SLA badges use distinct hue families — green, red, amber, blue, gray — with WCAG AA text contrast on their paired backgrounds. A CCO should be able to scan a case list in one pass and read every status without a legend.
+
+**Accent discipline.** The navy tertiary is the only interactive color. Primary buttons, focused inputs, and links all use it. The escalated red appears only for the `ESCALATED` status and SLA breaches — it carries a specific meaning and is never used as chrome.
+
+## Color tokens
+
+The full token set is defined in the YAML front-matter of `DESIGN.md`. The four foundational colors are:
+
+| Token | Value | Name / role |
+|---|---|---|
+| `primary` | `#0E1116` | "Archive ink" — headlines, body text, and hard rules |
+| `secondary` | `#5B6472` | Slate — metadata, captions, table headers |
+| `tertiary` | `#1F3A5F` | "Institutional navy" — the sole interactive color: primary buttons, focused inputs, links |
+| `neutral` | `#F7F5F1` | Warm parchment — app background; softer than pure white, signals archival paper |
+
+The `surface` (`#FFFFFF`) sits on top of the neutral background so panels read as filed documents on a desk. Borders use `#E3E6EC` (standard) and `#CFD4DC` (strong). Shadows are reserved for confirmation dialogs only.
+
+### Status palette
+
+Each case status has a foreground/background pair. Every pair clears WCAG AA contrast (4.5:1 minimum) between the foreground text color and the paired background.
+
+| Status | bg | fg |
+|---|---|---|
+| Approved | `#E1F1E7` | `#0A5C2E` |
+| Escalated | `#F8DEDE` | `#8A1414` |
+| Under review | `#FBEBCC` | `#7A4400` |
+| Open | `#DCE6F8` | `#133D81` |
+| Closed | `#EDF0F5` | `#5B6472` |
+
+SLA badges reuse the Approved pair for "on time" and the Escalated pair for "breached." The mapping is intentional: a breached SLA carries the same visual weight as an escalated case.
+
+## Typography
+
+The type stack is chosen for legibility at small sizes and for the specific associations each face carries in a professional context.
+
+| Use | Font family | Weight | Notes |
+|---|---|---|---|
+| Headlines (`h1`, `h2`) | Source Serif 4 | 600 | Carries the "filed document" register; used for page titles and panel titles |
+| Body | Inter | 400 | Sober, unremarkable, maximum legibility at 13–15px |
+| Identifiers | JetBrains Mono | 400 | Exclusively for values that belong in an audit: case IDs, AI `runId`s, model names, evidence paths |
+| Panel labels | Inter | 600 uppercase, 0.1em tracking | Reserved for section labels like "INPUTS", "AI SUGGESTION", "AUDIT TRAIL" — signals "this is a record section," not a visual flourish |
+
+Number-heavy content — balances, variances, timestamps — uses `font-variant-numeric: tabular-nums` so columns align across table rows.
+
+## Design tooling
+
+Two commands are available from the repo root:
+
+```bash
+# Validate DESIGN.md structure and check WCAG contrast ratios
+npm run design:lint
+
+# Write tokens.json (DTCG format) at the repo root
+npm run design:export
+```
+
+Both commands use the `@google/design.md` package via `npx`. You do not need to install it separately.
+
+## The DESIGN.md format
+
+`DESIGN.md` uses the [google-labs-code/design.md](https://github.com/google-labs-code/design.md) format: a YAML front-matter block containing structured design tokens, followed by markdown prose that explains the rationale behind the decisions.
+
+The YAML block defines tokens in categories:
+
+```yaml
+---
+version: alpha
+name: Ledger
+colors:
+  primary: "#0E1116"
+  tertiary: "#1F3A5F"
+  # ...
+typography:
+  h1:
+    fontFamily: Source Serif 4
+    fontSize: 1.75rem
+    fontWeight: 600
+  # ...
+components:
+  panel:
+    backgroundColor: "{colors.surface}"
+    rounded: "{rounded.md}"
+  # ...
+---
+```
+
+Token references use the `{token.path}` syntax to compose values from other tokens. For example, `badge-sla-breached` references `{colors.sla-breach-bg}` and `{colors.sla-breach-fg}`, which themselves reference `{colors.status-escalated-*}`. This keeps the token graph consistent without duplicating values.
+
+The markdown sections below the front-matter explain the reasoning: why serifs instead of sans-serif for headlines, why a single accent color, what the SLA color mapping communicates. Keeping rationale in source control means design decisions are reviewable, diffable, and preserved across team changes.
+
+`frontend/src/styles.css` mirrors the tokens 1:1 as CSS custom properties. The UI is a direct read of the design system — if you update a token in `DESIGN.md`, you update the CSS variable map, and the change propagates through the component tree.
+
+<Tip>
+  Run `npm run design:export` to produce `tokens.json` in DTCG (Design Token Community Group) format at the repo root. DTCG is the emerging standard for toolchain-portable token files — you can import `tokens.json` into Figma, Style Dictionary, or other token pipelines if you extend the design system.
+</Tip>

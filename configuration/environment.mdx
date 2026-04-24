@@ -1,0 +1,86 @@
+---
+title: "Environment setup for Cash Reconciliation Workflow"
+description: "Configure the backend .env variables that control AI provider selection, database connection, and CORS settings for the Cash Reconciliation Workflow."
+---
+
+The Cash Reconciliation Workflow reads its runtime settings from a single `.env` file in the `backend/` directory. Most defaults work out of the box — the only variable you need to set to unlock the OpenAI provider is `OPENAI_API_KEY`. Everything else has a sensible fallback that lets you run the full workflow offline.
+
+## The .env.example file
+
+Copy this file before starting the app for the first time:
+
+```bash
+cp backend/.env.example backend/.env
+```
+
+The example file contains all supported variables with their defaults:
+
+```bash
+DATABASE_URL="file:./dev.db"
+PORT=4000
+
+# Leave OPENAI_API_KEY empty to use the deterministic rule-based AI provider
+# (no network, no key needed). Set it to your OpenAI key to switch to the
+# real LLM provider. Either way, the provider choice is recorded in every
+# audit entry via `modelName`.
+OPENAI_API_KEY=""
+AI_MODEL="gpt-4o-mini"
+
+FRONTEND_ORIGIN="http://localhost:5173"
+```
+
+## Variables reference
+
+### DATABASE_URL
+
+The connection string for the database. The default (`file:./dev.db`) uses SQLite, which requires no setup and is sufficient for local use and demos.
+
+To switch to Postgres, change the `provider` in `backend/prisma/schema.prisma` to `postgresql` and set `DATABASE_URL` to a standard Postgres connection string:
+
+```bash
+DATABASE_URL="postgresql://user:password@localhost:5432/cash_rec"
+```
+
+The existing migrations are compatible with both databases.
+
+### OPENAI_API_KEY
+
+Controls which AI provider the backend activates at startup:
+
+| Value | Provider active |
+|---|---|
+| Empty (default) | `RuleBasedProvider` — deterministic, no network call, no key needed |
+| Your OpenAI key | `OpenAiProvider` — calls the OpenAI API using the model in `AI_MODEL` |
+
+Leave this blank to run the full workflow without an internet connection or any API costs. Set it when you want the AI suggestion step to use a real language model.
+
+<Note>
+  On startup the backend logs which provider was chosen. Look for a line like:
+
+  ```
+  [ai] OPENAI_API_KEY not set — using deterministic rule-based provider
+  ```
+
+  or
+
+  ```
+  [ai] using OpenAI provider (model=gpt-4o-mini)
+  ```
+
+  Either way, every AI suggestion permanently records the provider choice in the audit log via the `modelName` field.
+</Note>
+
+### AI_MODEL
+
+The OpenAI model name passed to the chat completions API when `OpenAiProvider` is active. Defaults to `gpt-4o-mini`. This value is also used as the `aiModel` field in the seeded `CASH_RECONCILIATION` case type's `rulesConfig`.
+
+This variable has no effect when `OPENAI_API_KEY` is empty.
+
+### PORT and FRONTEND_ORIGIN
+
+These control the local development setup:
+
+- `PORT` — the port the Express API listens on. Defaults to `4000`.
+- `FRONTEND_ORIGIN` — the origin the backend adds to its CORS allowlist. Defaults to `http://localhost:5173` (the Vite dev server default).
+
+You only need to change these if another process is already using port 4000 or 5173.

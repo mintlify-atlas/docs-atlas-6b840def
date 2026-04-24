@@ -1,0 +1,111 @@
+---
+title: "API overview: endpoints, auth, and base URL"
+description: "Complete reference for the Cash Reconciliation Workflow REST API — all 14 endpoints, role requirements, request format, and error response shapes."
+---
+
+The Cash Reconciliation Workflow exposes a REST API built with Express. By default the server listens on `http://localhost:4000`. All request and response bodies are JSON; set `Content-Type: application/json` on any request that sends a body. Authentication uses the `x-user-id` header — the middleware resolves it to a `User` record and populates `req.user`, which the role gates downstream read. Every shared type and Zod schema for requests and responses lives in the `shared/` package, so the shapes are validated at both the backend and frontend layers.
+
+<CardGroup cols={2}>
+  <Card title="Cases" icon="folder-open" href="/api/cases">
+    Create cases, retrieve case detail, trigger AI suggestions, and submit reviewer decisions.
+  </Card>
+  <Card title="Case types" icon="list" href="/api/case-types">
+    List and create the workflow definitions that parameterize rules, SLA, and AI model configuration.
+  </Card>
+  <Card title="Audit logs" icon="scroll" href="/api/audit-logs">
+    Pull the append-only compliance log filtered by date range for examiner or LP review.
+  </Card>
+  <Card title="Exports" icon="file-export" href="/api/exports">
+    Download CSV exports of cases and audit logs covering any date range.
+  </Card>
+</CardGroup>
+
+## Base URL
+
+The backend port defaults to `4000` and is configured by the `PORT` environment variable in `backend/.env`.
+
+```bash
+http://localhost:4000
+```
+
+All paths below are appended to this base URL. The frontend origin (`http://localhost:5173` by default) is the only CORS-allowed origin; set `FRONTEND_ORIGIN` in `backend/.env` to change it.
+
+## Request format
+
+All endpoints that accept a body expect JSON. Include the `Content-Type` header on those requests:
+
+```bash
+curl -X POST http://localhost:4000/cases \
+  -H "Content-Type: application/json" \
+  -H "x-user-id: <userId>" \
+  -d '{"caseTypeId": "...", "businessDate": "2026-04-24", "inputs": {}}'
+```
+
+The `x-user-id` header is the sole authentication mechanism. Its value must be the UUID of a seeded `User` record. See [Authentication](/api/authentication) for how the middleware resolves it and what happens when it is missing.
+
+## Response format
+
+All responses are JSON. Successful responses return the resource or a list of resources directly. Error responses follow a consistent shape:
+
+```json
+{
+  "error": "Forbidden. Required role(s): OPS, CCO. Current: ANALYST."
+}
+```
+
+Validation errors from Zod include an `issues` array alongside `error`:
+
+```json
+{
+  "error": "Validation failed",
+  "issues": [
+    { "code": "invalid_type", "path": ["businessDate"], "message": "Required" }
+  ]
+}
+```
+
+| HTTP status | Meaning |
+|-------------|---------|
+| `200` | Success |
+| `201` | Resource created |
+| `400` | Validation failed (Zod schema error) |
+| `401` | Missing `x-user-id` header or user not found |
+| `403` | User's role does not satisfy the endpoint's role gate |
+| `404` | Resource not found |
+| `500` | Unhandled server error |
+
+## Endpoints
+
+All 14 endpoints are listed below. The Role column shows the minimum role requirement; `—` means any request is accepted, including unauthenticated ones.
+
+| Method | Path | Role | Purpose |
+|--------|------|------|---------|
+| `GET` | `/health` | — | Liveness check — returns `{ ok: true, time: "..." }` |
+| `GET` | `/users` | — | Demo user directory — powers the UI **Acting as** switcher |
+| `GET` | `/case-types` | — | List all case types |
+| `GET` | `/case-types/:id` | — | Full case type with `rulesConfig` and `slaConfig` |
+| `POST` | `/case-types` | ADMIN / CCO | Create a case type |
+| `GET` | `/cases` | — | Filter cases by date, type, status, or SLA breach |
+| `GET` | `/cases/:id` | — | Case detail including the full audit log |
+| `POST` | `/cases` | any authed user | Create a case; writes a `CASE_CREATED` audit entry |
+| `PATCH` | `/cases/:id/inputs` | any authed user | Update case inputs before finalization |
+| `POST` | `/cases/:id/ai-suggestion` | any authed user | Run the AI provider; transitions status to `UNDER_REVIEW` but never finalizes |
+| `POST` | `/cases/:id/reviewer-decision` | OPS / CCO | Finalize the case; writes `DECISION_MADE` and, if applicable, `SLA_BREACH_RECORDED` |
+| `GET` | `/audit-logs` | — | Compliance log pull filtered by date range |
+| `GET` | `/export/cases.csv` | — | CSV export of cases |
+| `GET` | `/export/audit-logs.csv` | — | CSV export of audit log entries |
+
+## Role permissions
+
+The `requireRole` middleware in `backend/src/middleware/requireRole.ts` enforces which roles can call which endpoints. The table below summarizes the access model.
+
+| Role | Permissions |
+|------|-------------|
+| `ANALYST` | Create cases (`POST /cases`), update inputs (`PATCH /cases/:id/inputs`), trigger AI suggestions (`POST /cases/:id/ai-suggestion`) |
+| `OPS` | All ANALYST permissions, plus submit reviewer decisions (`POST /cases/:id/reviewer-decision`) |
+| `CCO` | All OPS permissions, plus create case types (`POST /case-types`) |
+| `ADMIN` | Create case types (`POST /case-types`) |
+
+<Info>
+  `GET` endpoints for cases, case types, audit logs, and exports are open — no authentication is required to read data. In a production deployment you would add authorization to these routes as part of a real auth layer.
+</Info>

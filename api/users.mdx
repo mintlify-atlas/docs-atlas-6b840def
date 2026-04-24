@@ -1,0 +1,56 @@
+---
+title: "Users API: list demo users and look up role IDs"
+description: "GET /users returns the seeded demo user list that powers the UI user switcher. Use it to find user IDs for the x-user-id authentication header."
+---
+
+The `/users` endpoint returns the full list of seeded demo users. The React frontend uses it to populate the **Acting as** dropdown in the top-right corner, and you can use it to find the `id` values needed for the `x-user-id` authentication header when calling other endpoints directly.
+
+## GET /users
+
+Returns all users ordered by name. No authentication required.
+
+```bash
+curl http://localhost:4000/users
+```
+
+**Response** — array of `User` objects:
+
+<ResponseField name="id" type="string">
+  Unique user identifier (cuid). Pass this as the `x-user-id` header to authenticate requests.
+</ResponseField>
+
+<ResponseField name="name" type="string">
+  Display name, e.g. `"Ava Analyst"`.
+</ResponseField>
+
+<ResponseField name="email" type="string">
+  User email address.
+</ResponseField>
+
+<ResponseField name="role" type="string">
+  One of `"ANALYST"`, `"OPS"`, `"CCO"`, or `"ADMIN"`.
+</ResponseField>
+
+## GET /users/me
+
+Returns the currently authenticated user (based on the `x-user-id` header), or `null` if unauthenticated.
+
+```bash
+curl http://localhost:4000/users/me \
+  -H "x-user-id: <userId>"
+```
+
+## Seeded demo users and roles
+
+The seed creates one user per role so you can demonstrate every permission in the workflow:
+
+| Name | Role | Can do |
+|---|---|---|
+| Ava Analyst | `ANALYST` | Create cases, update inputs, trigger AI suggestion |
+| Omar Ops | `OPS` | Everything ANALYST can do, plus submit reviewer decisions |
+| Casey CCO | `CCO` | Everything OPS can do, plus create case types |
+| Alex Admin | `ADMIN` | Create case types; same as CCO for case-type management |
+
+<Note>
+This endpoint exists for the demo's user-switcher UI. In a production system, the user directory would come from your identity provider — replacing the auth middleware is a single-file change to `backend/src/middleware/auth.ts`.
+</Note>

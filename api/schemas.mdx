@@ -1,0 +1,168 @@
+---
+title: "Shared Zod schemas and TypeScript types reference"
+description: "All API request and response types are defined once in the shared package using Zod, validated at both the frontend and backend with full TypeScript types."
+---
+
+Every request body and query parameter in the Cash Reconciliation Workflow API is validated by a Zod schema defined in `shared/src/schemas.ts`. The matching TypeScript types live in `shared/src/types.ts`. Because both the Express backend and the Vite/React frontend import from the same `@sec-workflow/shared` package, there is a single source of truth for every contract — no drift between what the server expects and what the client sends.
+
+## Request schemas
+
+### CreateCaseTypeInputSchema
+
+Used by `POST /case-types`.
+
+```typescript
+const CreateCaseTypeInputSchema = z.object({
+  name: z.string().min(1),
+  description: z.string(),
+  rulesConfig: RulesConfigSchema,
+  slaConfig: SlaConfigSchema,
+});
+```
+
+Where `RulesConfigSchema` is:
+
+```typescript
+const RulesConfigSchema = z.object({
+  varianceTolerance: z.number().nonnegative(),
+  requiredInputs: z.array(FieldDefinitionSchema),
+  requiredEvidence: z.array(z.string()),
+  escalationCriteria: z.array(z.string()),
+  aiModel: z.string().min(1),
+});
+```
+
+And `SlaConfigSchema` is:
+
+```typescript
+const SlaConfigSchema = z.object({
+  dueTimeOfDay: z.string().regex(/^\d{2}:\d{2}:\d{2}$/),
+  maxCompletionDelayMinutes: z.number().int().nonnegative(),
+  defaultReviewerRole: RoleSchema,
+});
+```
+
+### CreateCaseInputSchema
+
+Used by `POST /cases`.
+
+```typescript
+const CreateCaseInputSchema = z.object({
+  caseTypeId: z.string().min(1),
+  businessDate: z.string().min(1), // ISO date string (yyyy-mm-dd or full ISO)
+  inputs: z.record(z.unknown()),
+});
+```
+
+### UpdateCaseInputsSchema
+
+Used by `PATCH /cases/:id/inputs`.
+
+```typescript
+const UpdateCaseInputsSchema = z.object({
+  inputs: z.record(z.unknown()),
+});
+```
+
+### ReviewerDecisionInputSchema
+
+Used by `POST /cases/:id/reviewer-decision`. Requires role OPS or CCO.
+
+```typescript
+const ReviewerDecisionInputSchema = z.object({
+  finalStatus: z.enum(["APPROVED", "ESCALATED"]),
+  decisionNote: z.string().min(1).max(2000),
+});
+```
+
+### CaseListQuerySchema
+
+Used by `GET /cases` query parameters.
+
+```typescript
+const CaseListQuerySchema = z.object({
+  from: z.string().optional(),
+  to: z.string().optional(),
+  caseTypeId: z.string().optional(),
+  status: z.union([z.string(), z.array(z.string())]).optional(),
+  slaBreached: z.enum(["true", "false"]).optional(),
+});
+```
+
+### AuditLogQuerySchema
+
+Used by `GET /audit-logs` query parameters.
+
+```typescript
+const AuditLogQuerySchema = z.object({
+  from: z.string().optional(),
+  to: z.string().optional(),
+  caseId: z.string().optional(),
+});
+```
+
+### ExportQuerySchema
+
+Used by `GET /export/cases.csv` and `GET /export/audit-logs.csv`. Both `from` and `to` are required.
+
+```typescript
+const ExportQuerySchema = z.object({
+  from: z.string(),
+  to: z.string(),
+});
+```
+
+## TypeScript types
+
+The runtime-validated types are exposed as plain TypeScript interfaces for use in frontend code and typed service layers:
+
+```typescript
+export type Role = "ANALYST" | "OPS" | "CCO" | "ADMIN";
+
+export type CaseStatus =
+  | "OPEN"
+  | "UNDER_REVIEW"
+  | "APPROVED"
+  | "ESCALATED"
+  | "CLOSED";
+
+export type AuditActionType =
+  | "CASE_CREATED"
+  | "INPUTS_UPDATED"
+  | "AI_SUGGESTION_GENERATED"
+  | "DECISION_MADE"
+  | "SLA_BREACH_RECORDED";
+
+export interface Case {
+  id: string;
+  caseTypeId: string;
+  caseType?: CaseType;
+  businessDate: string;
+  status: CaseStatus;
+  createdAt: string;
+  updatedAt: string;
+  createdByUserId: string;
+  createdBy?: User;
+  reviewerUserId: string | null;
+  reviewer?: User | null;
+  inputs: Record<string, unknown>;
+  aiSuggestion: AiSuggestion | null;
+  reviewerDecision: ReviewerDecision | null;
+  dueAt: string;
+  slaBreached: boolean;
+}
+
+export interface AuditLogEntry {
+  id: string;
+  caseId: string;
+  timestamp: string;
+  actorType: ActorType;
+  actorId: string | null;
+  actionType: AuditActionType;
+  details: Record<string, unknown>;
+}
+```
+
+<Note>
+Enums like `Role`, `CaseStatus`, and `AuditActionType` are defined in both files: as Zod schemas in `schemas.ts` for runtime validation, and as TypeScript union types in `types.ts` for compile-time safety. Both sets are exported from `shared/src/index.ts` and available to any workspace package via `@sec-workflow/shared`.
+</Note>

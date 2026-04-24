@@ -1,0 +1,107 @@
+---
+title: "SLA tracking: deadlines, breach detection, and audit"
+description: "How dueAt is computed from SlaConfig at case creation, how breach detection runs at decision time, and the SLA_BREACH_RECORDED audit entry."
+---
+
+Every case has a hard deadline — a `dueAt` timestamp computed at creation time from the case type's SLA configuration. When a reviewer finalizes a case, the system immediately checks whether the decision landed before or after that deadline. If the deadline was missed, a `SLA_BREACH_RECORDED` audit entry is written in the same transaction as `DECISION_MADE`, and the case's `slaBreached` flag is set permanently. From that point on, the breach is visible in the case list even if the case is otherwise approved and closed.
+
+<Tip>
+SLA breach is a first-class field — not a derived property computed at read time — because it is the first thing a compliance reviewer or examiner looks at when scanning the case list. Surfacing it as a filterable, persistent flag means the UI can show "all SLA breaches this month" without scanning audit logs, and the data exports include it as a plain column.
+</Tip>
+
+## The SlaConfig interface
+
+SLA parameters are stored on `CaseType` as a JSON column and parsed into this interface:
+
+```typescript
+export interface SlaConfig {
+  dueTimeOfDay: string;              // "16:00:00" — target completion time
+  maxCompletionDelayMinutes: number; // added on top of dueTimeOfDay
+  defaultReviewerRole: Role;
+}
+```
+
+`dueTimeOfDay` is a wall-clock time in `HH:MM:SS` format. `maxCompletionDelayMinutes` is added on top of that time, so a config of `dueTimeOfDay: "16:00:00"` and `maxCompletionDelayMinutes: 0` means the hard deadline is exactly 16:00 on the business date.
+
+## Computing dueAt at creation
+
+`computeDueAt` in `slaService.ts` runs once when the case is created:
+
+```typescript
+export function computeDueAt(businessDate: Date, slaConfig: SlaConfig): Date {
+  const [h, m, s] = slaConfig.dueTimeOfDay.split(":").map((n) => parseInt(n, 10));
+  const due = new Date(businessDate);
+  due.setHours(h ?? 16, m ?? 0, s ?? 0, 0);
+  due.setTime(due.getTime() + slaConfig.maxCompletionDelayMinutes * 60_000);
+  return due;
+}
+```
+
+The result is stored on `Case.dueAt` and never updated. The SLA snapshot in the `CASE_CREATED` audit entry records both `dueAt` and the `slaConfig` that produced it, so the deadline is self-documented even if the case type's SLA policy is later changed.
+
+## Breach detection at decision time
+
+When a reviewer submits a decision, `isSlaBreached` runs synchronously before any writes:
+
+```typescript
+export function isSlaBreached(dueAt: Date, decidedAt: Date): boolean {
+  return decidedAt.getTime() > dueAt.getTime();
+}
+
+export function delayMinutes(dueAt: Date, decidedAt: Date): number {
+  return Math.max(0, Math.floor((decidedAt.getTime() - dueAt.getTime()) / 60_000));
+}
+```
+
+If `decidedAt` is after `dueAt`, the breach flag is `true`. The delay in whole minutes is also computed and stored in the audit entry.
+
+## SLA_BREACH_RECORDED as a separate audit entry
+
+When a breach is detected, the `recordReviewerDecision` function in `caseService.ts` writes two audit entries in the same transaction:
+
+```typescript
+// First entry — the human decision
+await writeAudit(tx, {
+  caseId,
+  actorType: "USER",
+  actorId: reviewerUserId,
+  actionType: "DECISION_MADE",
+  details: {
+    finalStatus: decision.finalStatus,
+    decisionNote: decision.decisionNote,
+    decidedAt: decision.decidedAt,
+    priorAiSuggestion: ...,
+    dueAt: existing.dueAt.toISOString(),
+  },
+});
+
+// Second entry — the SLA breach (written only if breached)
+if (breached) {
+  await writeAudit(tx, {
+    caseId,
+    actorType: "SYSTEM",
+    actorId: null,
+    actionType: "SLA_BREACH_RECORDED",
+    details: {
+      dueAt: existing.dueAt.toISOString(),
+      decidedAt: decision.decidedAt,
+      delayMinutes: delayMinutes(existing.dueAt, decidedAt),
+    },
+  });
+}
+```
+
+`SLA_BREACH_RECORDED` is written by the `SYSTEM` actor — it is not a human action, it is the server recording an objective fact. Keeping it as a separate audit entry (rather than folding breach details into `DECISION_MADE`) means you can query for all SLA breaches across cases by filtering on `actionType = SLA_BREACH_RECORDED` without parsing the details of every decision entry.
+
+## SLA breach and final status are orthogonal
+
+A case can be `APPROVED` and also have `slaBreached: true`. These are independent fields. The reviewer's decision (`APPROVED` or `ESCALATED`) reflects whether the reconciliation passed or required escalation. The SLA breach flag reflects whether the decision was timely. An approved-but-late case is a compliance event regardless of the outcome.
+
+The case list accepts a `slaBreached` query parameter so you can filter specifically for breached cases regardless of their final status:
+
+```
+GET /cases?slaBreached=true
+GET /cases?slaBreached=true&status=APPROVED
+```
+
+Both the `GET /export/cases.csv` endpoint and the `npm run export` CLI include `slaBreached` as a column in the output, so the field survives into any examiner-facing report without post-processing.
